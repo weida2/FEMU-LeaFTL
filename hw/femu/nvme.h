@@ -1157,6 +1157,15 @@ typedef struct OcCtrlParams {
 } OcCtrlParams;
 
 struct FemuCtrl;
+
+typedef struct StatLeaFTL {
+    u_int32_t num_seg;
+    u_int32_t num_group;
+    char      ftl_type[10];
+    char      runtime_env[10];
+}StatLeaFTL;
+
+
 typedef struct FemuExtCtrlOps {
     void     *state;
     void     (*init)(struct FemuCtrl *, Error **);
@@ -1167,6 +1176,9 @@ typedef struct FemuExtCtrlOps {
     uint16_t (*io_cmd)(struct FemuCtrl *, NvmeNamespace *, NvmeCmd *, NvmeRequest *);
     uint16_t (*get_log)(struct FemuCtrl *, NvmeCmd *);
 } FemuExtCtrlOps;
+
+
+
 
 typedef struct FemuCtrl {
     PCIDevice       parent_obj;
@@ -1325,6 +1337,11 @@ typedef struct FemuCtrl {
 
     /* Nand Flash Type: SLC/MLC/TLC/QLC/PLC */
     uint8_t         flash_type;
+
+
+    // LeaFTL extesion
+    StatLeaFTL      stat_leaftl;
+    bool            print_segment;
 } FemuCtrl;
 
 typedef struct NvmePollerThreadArgument {

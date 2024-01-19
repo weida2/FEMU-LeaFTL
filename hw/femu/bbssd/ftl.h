@@ -3,9 +3,16 @@
 
 #include "../nvme.h"
 
+#include "leaftl.h"
+#define  error_bound 0   // 误差范围
+// #include "test.hpp"
+
 #define INVALID_PPA     (~(0ULL))
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
+
+#define WB_Entries      1024
+// 1k * 4KB = 4MB 假设SSD内写入缓冲区的大小为 4MB 可以缓存1k条lpa：ppa条目
 
 enum {
     NAND_READ =  0,
@@ -42,6 +49,8 @@ enum {
     FEMU_RESET_ACCT = 5,
     FEMU_ENABLE_LOG = 6,
     FEMU_DISABLE_LOG = 7,
+    FEMU_ENABLE_LEAWRITE = 8,
+
 };
 
 
@@ -194,14 +203,26 @@ struct nand_cmd {
     int64_t stime; /* Coperd: request arrival time */
 };
 
+typedef struct Write_Buffer {
+    uint32_t LPA;
+    uint32_t PPA;
+} Write_Buffer;
+
 struct ssd {
     char *ssdname;
     struct ssdparams sp;
     struct ssd_channel *ch;
     struct ppa *maptbl; /* page level mapping table */
-    uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
+    uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */ 
     struct write_pointer wp;
     struct line_mgmt lm;
+
+
+    struct Write_Buffer WB[WB_Entries + 2];
+    int    num_write_entries;
+    FrameGroup l_maptbl;
+    bool enable_leaftl_write;
+    bool flush; 
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;

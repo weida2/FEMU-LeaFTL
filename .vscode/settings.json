@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "nvme.h": "c",
+        "*.code": "c",
+        "random": "c"
+    }
+}

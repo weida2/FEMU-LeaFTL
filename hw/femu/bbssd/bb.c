@@ -65,6 +65,10 @@ static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
         n->print_log = false;
         femu_log("%s,Log print [Disabled]!\n", n->devname);
         break;
+    case FEMU_ENABLE_LEAWRITE:
+        ssd->enable_leaftl_write = true;
+        femu_log("%s,LeaFTL_Write [enabled]!\n", n->devname);
+        break;
     default:
         printf("FEMU:%s,Not implemented flip cmd (%lu)\n", n->devname, cdw10);
     }
