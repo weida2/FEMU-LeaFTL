@@ -2,6 +2,10 @@
     "files.associations": {
         "nvme.h": "c",
         "*.code": "c",
-        "random": "c"
+        "random": "c",
+        "chrono": "c",
+        "cmath": "c",
+        "*.inc": "c",
+        "math.h": "c"
     }
 }

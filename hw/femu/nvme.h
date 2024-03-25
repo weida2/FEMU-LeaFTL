@@ -1388,6 +1388,7 @@ static inline bool BBSSD(FemuCtrl *n)
     return (n->femu_mode == FEMU_BBSSD_MODE);
 }
 
+
 static inline bool NOSSD(FemuCtrl *n)
 {
     return (n->femu_mode == FEMU_NOSSD_MODE);

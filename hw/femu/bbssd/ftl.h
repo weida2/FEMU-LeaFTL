@@ -4,7 +4,7 @@
 #include "../nvme.h"
 
 #include "leaftl.h"
-#define  error_bound 0   // 误差范围
+#define  error_bound 20   // 误差范围
 // #include "test.hpp"
 
 #define INVALID_PPA     (~(0ULL))
@@ -49,7 +49,11 @@ enum {
     FEMU_RESET_ACCT = 5,
     FEMU_ENABLE_LOG = 6,
     FEMU_DISABLE_LOG = 7,
-    FEMU_ENABLE_LEAWRITE = 8,
+    FEMU_ENABLE_LEAWRITE  = 8,
+    FEMU_ENABLE_LEAREAD   = 9,
+    FEMU_Group_Static     = 10,
+    FEMU_DISABLE_LEAWRITE = 11,
+    FEMU_DISABLE_LEAREAD  = 12,
 
 };
 
@@ -220,8 +224,10 @@ struct ssd {
 
     struct Write_Buffer WB[WB_Entries + 2];
     int    num_write_entries;
+    int    hit_wb;
     FrameGroup l_maptbl;
     bool enable_leaftl_write;
+    bool enable_leaftl_read;
     bool flush; 
 
     /* lockless ring for communication with NVMe IO thread */

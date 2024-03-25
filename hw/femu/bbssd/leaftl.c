@@ -12,7 +12,7 @@ void crb_init(CRB *crb) {
 void crb_insert_segment(CRB *crb, Segment* seg) {
     uint8_t start_lpa = seg->x1;
     // Check if the CRB is already full
-    if (crb->num_segments >= MAX_CRB_SEGMENTS) {
+    if (crb->num_segments == MAX_CRB_SEGMENTS - 1) {
         femu_log("CRB is full. Cannot insert segment.\n");
         return;
     }
@@ -84,10 +84,22 @@ unsigned int crb_find_segment(CRB *crb, uint8_t lpa) {
 bool Segment_is_valid(Segment *seg, uint32_t x) {
     if (!(x >= seg->x1 && x <= seg->x2))
         return false;
-    if (seg->accurate) {
-        int k = round(1.0/seg->k)   ; 
-        if (((x - seg->x1) % k) != 0)        // 这里可能很多不通过
-            return false;
+    if (seg->consecutive) {
+            if (seg->k != 0) {
+            int k = round(1.0/seg->k);
+            if (k != 0) {
+                if (((x - seg->x1) % k) != 0)        // 这里可能很多不通过
+                    return false;
+            } else {
+                // TODO
+            }
+        }
+    }
+    else {
+        if (seg->filter.bitmap) {
+            return seg->filter.bitmap[x - seg->x1];
+        }
+        return false;
     }
     // 暂时未添加 判断 x 是否在段上的条件
     // else {
@@ -98,13 +110,14 @@ bool Segment_is_valid(Segment *seg, uint32_t x) {
 }
 
 
-uint32_t Segment_gety(Segment *seg, uint32_t x) {
+
+uint32_t Segment_gety(Segment *seg, bool check, uint32_t x) {
     int predict = 0;
-    if (Segment_is_valid(seg, x)) {
+    if (!check || Segment_is_valid(seg, x)) {
             predict = round(x*seg->k + seg->b);
             return predict;
     }
-    return -1;
+    return predict;
 }
 
 int isConsecutive(Point *points, int num_points) {
@@ -126,20 +139,19 @@ void Segment_check_properties(Segment *seg, Point *points, int num_points) {
     
     for (int i = 0; i < num_points; i++) {
         uint32_t ppa;
-        ppa = Segment_gety(seg, points[i].x);
+        ppa = Segment_gety(seg, false, points[i].x);
         if (ppa != points[i].y) {
             seg->accurate = false;
         }
-        if (!isConsecutive(points, num_points)) {
+        if (!seg->accurate) return ;
+    }
+    if (!isConsecutive(points, num_points)) {
             seg->consecutive = false;
-        }
-
-        if (!seg->accurate && !seg->consecutive) return ;
     }
 }
 
 
-void Segment_init(Segment *seg, float k, double b, int x1, int x2, Point *points, int num_points) {
+void Segment_init(Segment *seg, double k, double b, int x1, int x2, Point *points, int num_points) {
     seg->k = k;
     seg->b = b;
     seg->x1 = x1;
@@ -153,7 +165,7 @@ void Segment_init(Segment *seg, float k, double b, int x1, int x2, Point *points
     if (points != NULL) {
         Segment_check_properties(seg, points, num_points);
 
-        if (!seg->consecutive) {
+        if (1 || !seg->consecutive) {
             // 初始化位图
             if (seg->filter.bitmap != NULL) {
                 free(seg->filter.bitmap);
@@ -180,17 +192,24 @@ bool Segment_overlaps(Segment *seg1, Segment *seg2) {
 }
 
 
-// may has a bug
+// may has a bug // fix
 void Segment_merge(Segment *new_seg, Segment *old_seg, int *samelevel) {
-    //不重叠
+    //原本就不重叠
+    // 但是这个条件的话应该不会进入这个循环中
+    if (!old_seg || !old_seg->k || !old_seg->x1 || !old_seg->filter.bitmap) {
+        *samelevel = 2;
+        return;
+    }
+
     if (new_seg->x1 >= old_seg->x2 || new_seg->x2 <= old_seg->x1) {
-        *samelevel = 1;  
+        *samelevel = 2;  
         return ;
     } 
     //else if (new_seg->consecutive)  no use new_seg->consecutive
+    if (0 && DeBUG) femu_log("new_seg.x1: %u, x2: %u, old_seg.x1: %u, old_seg.x2: %u\n", new_seg->x1, new_seg->x2, old_seg->x1, old_seg->x2);
 
     int start = L_MIN(new_seg->x1, old_seg->x1);
-    int end   = L_MAX(new_seg->x2, new_seg->x2);
+    int end   = L_MAX(new_seg->x2, old_seg->x2);
 
     Bitmap new_bm, old_bm;
     new_bm.length = end - start + 1;
@@ -199,6 +218,23 @@ void Segment_merge(Segment *new_seg, Segment *old_seg, int *samelevel) {
     old_bm.bitmap = (unsigned char *)malloc(old_bm.length * sizeof(unsigned char));
     memset(new_bm.bitmap, 0, new_bm.length * sizeof(unsigned char)); 
     memset(old_bm.bitmap, 0, old_bm.length * sizeof(unsigned char));
+
+    if (0 && DeBUG) {
+        femu_log("new_seg.bitmap:");
+        for (int i = 0; i < new_seg->filter.length; i++) {
+            printf("%u", new_seg->filter.bitmap[i]);
+        }
+        printf("\n");
+        femu_log("old_seg.bitmap:");
+        for (int i = 0; i < old_seg->filter.length; i++) {
+            printf("%u", old_seg->filter.bitmap[i]);
+        }
+        printf("\nnew_bm.length: %d, new_bm.bitmap:", new_bm.length);
+        for (int i = 0; i < new_bm.length; i++) {
+            printf("%u", new_bm.bitmap[i]);
+        }    
+        printf("\n");
+    }
 
     int j = 0;
     for (int i = new_seg->x1 - start; i < new_seg->x2 - start + 1; i++) {
@@ -217,13 +253,13 @@ void Segment_merge(Segment *new_seg, Segment *old_seg, int *samelevel) {
     }
     
     // Debug
-    if (0) {
-        femu_log("new_bm:");
+    if (0 && DeBUG) {
+        printf("new_bm:");
         for (int i = 0; i < end - start + 1; i++) {
             printf(" %u", new_bm.bitmap[i]);
         }
         printf("\n");
-        femu_log("old_bm:");
+        printf("old_bm:");
         for (int i = 0; i < end - start + 1; i++) {
             printf(" %u", old_bm.bitmap[i]);
         }
@@ -300,8 +336,12 @@ Point intersection(SimpleSegment *s1, SimpleSegment *s2) {
 
 InsecPoint inter_section(SimpleSegment *s1, SimpleSegment *s2) {
     InsecPoint insec_pt;
-    insec_pt.x = (float) ((s2->b - s1->b) / (s1->k - s2->k));
-    insec_pt.y = (float) ((s1->k * s2->b - s2->k * s1->b) / (s1->k - s2->k));
+    insec_pt.x = 0, insec_pt.y = 0;
+    // fix bug 如果两条直线平行或重叠是不会有交点的
+    if (s1->k != s2->k) {
+        insec_pt.x = (double) ((s2->b - s1->b) / (s1->k - s2->k));
+        insec_pt.y = (double) ((s1->k * s2->b - s2->k * s1->b) / (s1->k - s2->k));
+    }
     return insec_pt;
 }
 
@@ -327,8 +367,8 @@ Point get_lower_bound(Point *pt, double gamma) {
 
 SimpleSegment frompoints(Point p1, Point p2) {
     SimpleSegment simplesegment;
-    simplesegment.k = (float)((p2.y - p1.y) / (p2.x - p1.x));
-    simplesegment.b = -simplesegment.k * p1.x + p1.y;
+    simplesegment.k = (double)((double)(int32_t)(p2.y - p1.y) / (p2.x - p1.x));
+    simplesegment.b = (double)((double)(p1.y * p2.x) - (double)(p1.x * p2.y)) / (p2.x - p1.x);
     simplesegment.x1 = p1.x;
     simplesegment.x2 = p2.x;
     return simplesegment;
@@ -336,8 +376,8 @@ SimpleSegment frompoints(Point p1, Point p2) {
 
 SimpleSegment frompoints_insec(InsecPoint p1, Point p2) {
     SimpleSegment simplesegment;
-    simplesegment.k = (float)((p2.y - p1.y) / (p2.x - p1.x));
-    simplesegment.b = -simplesegment.k * p1.x + p1.y;
+    simplesegment.k = (double)((double)(int32_t)(p2.y - p1.y) / (p2.x - p1.x));
+    simplesegment.b = (double)((double)(p1.y * p2.x) - (double)(p1.x * p2.y)) / (p2.x - p1.x);
     simplesegment.x1 = p1.x;
     simplesegment.x2 = p2.x;
     return simplesegment;
@@ -369,11 +409,14 @@ void plr__init(PLR* plr) {
     plr_destroy(plr);
 
     plr->segments = g_malloc0(sizeof(Segment) * (plr->max_length));
+    for (int i = 0; i < plr->max_length; i++) {
+        Segment_init(&plr->segments[i], 0, 0, 0, 0, NULL, 0);
+    }
 
     plr->s0.x = 0, plr->s0.y = 0;   // init point
     plr->s1.x = 0, plr->s1.y = 0;
-    plr->rho_upper.x1 = 0, plr->rho_upper.x2 = 0;
-    plr->rho_lower.x1 = 0, plr->rho_lower.x2 = 0;
+    plr->rho_upper.k = 0, plr->rho_upper.b = 0, plr->rho_upper.x1 = 0, plr->rho_upper.x2 = 0;
+    plr->rho_lower.k = 0, plr->rho_lower.b = 0, plr->rho_lower.x1 = 0, plr->rho_lower.x2 = 0;
     plr->sint.x = 0, plr->sint.y = 0;
     plr->state = PLR_CONSTANTS_FIRST;
     
@@ -396,6 +439,7 @@ void plr_add_segment(PLR *plr, Segment *seg) {
 }
 
 void plr_destroy(PLR* plr) {
+   // femu_log("[plr_destroy]: 此次学习完成, 删除临时plr->segments\n");
     if (plr->segments != NULL) {
         free(plr->segments);
         plr->segments = NULL;
@@ -421,8 +465,16 @@ int build_segment(PLR* plr, Segment *seg) {
 
         // 建立多点段
         else if (plr->state == PLR_CONSTANTS_READY) {
-            float avg_slope = (float16)((plr->rho_lower.k + plr->rho_upper.k) / 2.0);
-            double intercept = -plr->sint.x * avg_slope + plr->sint.y;
+            double avg_slope = ((plr->rho_lower.k + plr->rho_upper.k) / 2.0);
+            double intercept = 0;
+            if (plr->sint.x == 0 && plr->sint.y == 0) {
+                // intercept = -avg_slope * plr->s0.x + plr->s0.y;    // 不精确
+                intercept = (double)((int32_t)(plr->s0.y * plr->s1.x) - (int32_t)(plr->s1.y * plr->s0.x)) / (plr->s1.x - plr->s0.x);
+            } else {
+                intercept = -avg_slope * plr->sint.x + plr->sint.y;
+                
+            }
+            
             Segment_init(seg, avg_slope, intercept, plr->s0.x, plr->s1.x, plr->points, plr->num_points);
         }
         return 1;
@@ -430,8 +482,8 @@ int build_segment(PLR* plr, Segment *seg) {
 
 bool should_stop(PLR* plr, Point *point) {
     if (plr->s1.x == 0) {
-        if (point->x > plr->s0.x + plr->max_length) return true;
-    }else if (point->x > plr->s1.x + plr->max_length) return true;
+        if (point->x > plr->s0.x + plr->max_length || point->x < plr->s0.x) return true;  // 段的横向长度
+    }else if (point->x > plr->s1.x + plr->max_length || point->x < plr->s0.x) return true;
 
     return false;
 }
@@ -439,15 +491,22 @@ bool should_stop(PLR* plr, Point *point) {
 
 // 处理点的函数,up and lower 有界误差范围的线性回归学习
 int process_point(PLR* plr, Point* point, Segment *seg) {
+
+   // femu_log("[process_point]: in\n");
+
     int ret = 0;
     if (plr->state == PLR_CONSTANTS_FIRST) {
         plr->s0 = *point;
         plr->state = PLR_CONSTANTS_SECOND;
     } else if (plr->state == PLR_CONSTANTS_SECOND) {
         if (should_stop(plr, point)) {
-            ret = build_segment(plr, seg);
+            ret = build_segment(plr, seg);    //这里建
 
             plr->s0 = *point;
+            plr->s1.x = 0, plr->s1.y = 0;
+            plr->rho_upper.k = 0, plr->rho_upper.b = 0, plr->rho_upper.x1 = 0, plr->rho_upper.x2 = 0;
+            plr->rho_lower.k = 0, plr->rho_lower.b = 0, plr->rho_lower.x1 = 0, plr->rho_lower.x2 = 0;
+            plr->sint.x = 0, plr->sint.y = 0;
             plr->state = PLR_CONSTANTS_SECOND;
 
             free(plr->points);
@@ -455,7 +514,7 @@ int process_point(PLR* plr, Point* point, Segment *seg) {
             plr->num_points = 0;
         }else{
             plr->s1 = *point;
-            // rho_lower 和 rho_upper 和 sint 还不知道作用是啥
+            // rho_lower 和 rho_upper 和 sint  与gamma的斜率相关
             plr->rho_lower = frompoints(get_upper_bound(&plr->s0, plr->gamma), 
                                                     get_lower_bound(&plr->s1, plr->gamma));
             plr->rho_upper = frompoints(get_lower_bound(&plr->s0, plr->gamma), 
@@ -465,9 +524,15 @@ int process_point(PLR* plr, Point* point, Segment *seg) {
             plr->state = PLR_CONSTANTS_READY;
         }
     } else if (plr->state == PLR_CONSTANTS_READY) {
-        if (!is_above(point, &plr->rho_lower) || !is_below(point, &plr->rho_upper) || should_stop(plr, point)) {
-            ret = build_segment(plr, seg);
+        // 如果这个点既不在下界上面也不在上界下面而且x坐标距离已经超出了s0开始的值(256) 则建段
+        if (is_below(point, &plr->rho_lower) || is_above(point, &plr->rho_upper) || should_stop(plr, point)) {
+            ret = build_segment(plr, seg);     
+
             plr->s0 = *point;
+            plr->s1.x = 0, plr->s1.y = 0;
+            plr->rho_upper.k = 0, plr->rho_upper.b = 0, plr->rho_upper.x1 = 0, plr->rho_upper.x2 = 0;
+            plr->rho_lower.k = 0, plr->rho_lower.b = 0, plr->rho_lower.x1 = 0, plr->rho_lower.x2 = 0;
+            plr->sint.x = 0, plr->sint.y = 0;
             plr->state = PLR_CONSTANTS_SECOND;
 
             free(plr->points);
@@ -488,13 +553,14 @@ int process_point(PLR* plr, Point* point, Segment *seg) {
     }
 
     if (plr->num_points == 0) {
-            plr->points = malloc(1 * sizeof(Point));
-        } else {
-            plr->points = realloc(plr->points, (plr->num_points + 1) * sizeof(Point));
-        }
-        plr->points[plr->num_points] = *point;
-        plr->num_points++;
-    
+            plr->points = (Point *)malloc(sizeof(Point));
+    } else {
+        plr->points = (Point *)realloc(plr->points, (plr->num_points + 1) * sizeof(Point));
+    }
+    plr->points[plr->num_points] = *point;
+    plr->num_points++;
+
+  //  femu_log("[process_point]: out\n");
     return ret;
 }
 
@@ -504,24 +570,27 @@ void plr_learn(PLR* plr, Point* points, int num_points) {
     //Segment* rejs = malloc(num_points * sizeof(Segment));
     //int num_rejs = 0;
 
-
+    // femu_log("[plr_learn]: in\n");
 
     for (int i = 0; i < num_points; i++) {
         Segment seg;
+        Segment_init(&seg, 0, 0, 0, 0, NULL, 0);
         int ret = process_point(plr, &points[i], &seg);
         if (ret) {
-            femu_log("[plr_learn]: 学习成功后添加段\n");
+            //femu_log("[plr_learn]: 学习成功后添加段\n");
             plr_add_segment(plr, &seg);
         }
     }
 
     Segment final_seg;
+    Segment_init(&final_seg, 0, 0, 0, 0, NULL, 0);
     int ret = build_segment(plr, &final_seg);
     if (ret) {
-            femu_log("[plr_learn]: 学习成功后添加段(最后的段)\n");
+           // femu_log("[plr_learn]: 学习成功后添加段(最后的段)\n");
             plr_add_segment(plr, &final_seg);
     }
 
+    // femu_log("[plr_learn]: out\n");
    // *num_segments = plr->num_segments;
     return ;
 }
@@ -560,14 +629,15 @@ void LogPLR_init(LogPLR *logplr, int level) {
 }
 
 
-uint8_t binary_search(LogPLR *logplr, Segment *seg) {
-    uint8_t left = 0;
-    uint8_t right = logplr->num_segments - 1;
-    uint8_t mid = 0;
-    uint8_t target = seg->x1;
+// debug tmp use -> uint32_t target
+int8_t binary_search(LogPLR *logplr, Segment *seg) {
+    int8_t left = 0;
+    int8_t right = logplr->num_segments - 1;
+    int8_t mid = 0;
+    uint32_t target = seg->x1;
     while (left <= right) {
         mid = left + (right - left) / 2;
-
+        //femu_log("[begin] left:%u, right:%u, mid:%u\n",left, right, mid);
         if (logplr->segments[mid].x1 == target) {
             // 如果找到目标元素，则直接返回其索引
             return mid;
@@ -577,6 +647,7 @@ uint8_t binary_search(LogPLR *logplr, Segment *seg) {
         } else {
             right = mid - 1;
         }
+       // femu_log("[end] left:%u, right:%u, mid:%u\n",left, right, mid);
     }
     // 当循环结束时，说明目标元素在数组中不存在
     // 此时，left表示应该插入的位置
@@ -597,7 +668,7 @@ void LogPLR_add_segment(LogPLR *logplr, Segment *seg, int *index) {
         uint8_t pos = binary_search(logplr, seg);
         *index = pos;
         logplr->num_segments++;
-        for (int i = logplr->num_segments - 1; i >= pos + 1; i++) {
+        for (int i = logplr->num_segments - 1; i >= pos + 1; i--) {
             logplr->segments[i] = logplr->segments[i - 1];
         }
         logplr->segments[pos] = *seg;
@@ -619,6 +690,7 @@ void LogPLR_del_segment(LogPLR *logplr, int pos) {
         free(logplr->segments);
         logplr->segments = NULL;
     }
+    //femu_log("删除成功: %d\n", pos);
 }
 
 
@@ -683,18 +755,22 @@ void Group_del_segments(Group *group, int level, int pos) {
 }
 
 void Group_add_segments(Group *group, int level, Segment *segments, int num_segments, bool recursive) {
+
+    //femu_log("[Group_add_segments]: in\n");
+
     while (group->num_levels <= level) {
         Group_add_LogPLR(group);
     }
 
    // LogPLR *Li = &group->L[level];
-    Segs confict_segs;
+    Segs_Simple confict_segs;
     confict_segs.num_segments = 0;
     confict_segs.segments = NULL;
 
+    // femu_log("[Group_add_segments]: num_segments:%d, %s递归添加\n", num_segments, recursive ? "是" : "不是");
     for (int i = 0; i < num_segments; i++) {
      //   Segment *seg = &segments[i];
-        femu_log("segment:[%d] add to level: %d\n", i, level);
+        //femu_log("segment:[%d].x1 = %u, add to level: L%d\n", i,segments[i].x1, level);
         int index = 0;
         if (group->L[level].num_segments == 0) {
             LogPLR_add_segment(&group->L[level], &segments[i], &index);
@@ -703,12 +779,17 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
         Segs overlap_segs;
         overlap_segs.num_segments = 0;
         overlap_segs.segments = NULL;
+        memset(overlap_segs.segment_id, 0, 20 * sizeof(int));
 
         LogPLR_add_segment(&group->L[level], &segments[i], &index);
         if (index != 0) {
             // 在前面的最多只有一个重叠
-            Segs_add_segment(&overlap_segs, &group->L[level].segments[index - 1], index - 1);
+            // Segs_add_segment 处理重复段函数
+            if (group->L[level].segments[index].x1 < group->L[level].segments[index - 1].x2) {
+                Segs_add_segment(&overlap_segs, &group->L[level].segments[index - 1], index - 1);
+            }
         }
+        // overlap_segs.numsegs = 1;
         for (int j = index + 1; j < group->L[level].num_segments; j++) {
             // 添加后续的重叠区间段
             if (group->L[level].segments[j].x1 >= segments[i].x2) {
@@ -716,38 +797,71 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
             }
             Segs_add_segment(&overlap_segs, &group->L[level].segments[j], j);            
         }
+        
+        // debug
+        if (0 && DeBUG) {
+            femu_log("group[%d]->L[%d] 目前重叠段数为: %d\n", group->group_id, level, overlap_segs.num_segments);
+        }
 
         uint8_t indices_to_delete[50];
         int     indect_pointer = 0;
+
         for (int j = 0; j < overlap_segs.num_segments; j++) {
-            int same_level = 1;
-            // 段合并 same_level 判断合并操作后的旧段状态 1: 同一层不重叠, 0:同一层重叠, -1:旧段不存在，被新段完全包含 
+            int same_level = 2;
+            // 段合并 same_level 判断合并操作后的旧段状态 2:原本就不重叠, 1: 处理后同一层不重叠, 0:处理后同一层仍重叠, -1:处理后旧段不存在，被新段完全包含 
             Segment_merge(&segments[i], &overlap_segs.segments[j], &same_level);
+            // femu_log("same_level: %d\n", same_level);
             if (same_level == -1) {
                 indices_to_delete[indect_pointer++] = overlap_segs.segment_id[j]; 
             } else if (same_level == 0) {
-                Segs_add_segment(&confict_segs, &overlap_segs.segments[j], overlap_segs.segment_id[j]);
+                // confict_segs在这里添加 此时recursive = true
+                //Segs_add_segment(&confict_segs, &overlap_segs.segments[j], 1);
+                
+                if (confict_segs.num_segments == 0) {
+                    confict_segs.segments = (Segment *)malloc(1 * sizeof(Segment));
+                    confict_segs.segments[0] = overlap_segs.segments[j];
+                    confict_segs.num_segments++;
+                } else {
+                    confict_segs.segments = (Segment *)realloc(confict_segs.segments, (confict_segs.num_segments + 1) * sizeof(Segment));
+                    confict_segs.segments[confict_segs.num_segments] = overlap_segs.segments[j];
+                    confict_segs.num_segments++;
+                }
+
                 indices_to_delete[indect_pointer++] = overlap_segs.segment_id[j];                   
+            } else if (same_level == 1) {
+                // TODO
+                // 合并后不重叠此时应该处理原group->L[level].segments[j]的段
+                // 将overlap_segs.segments[j]段的值同步到g            roup->L[level].segments[j]的段的值中
+            } else if (same_level == 2) {
+                // 基本不会进入此个条件
             }
 
+        }
+    
+        if (overlap_segs.segments != NULL) {
+            free(overlap_segs.segments);
+            overlap_segs.num_segments = 0;
+            overlap_segs.segments = NULL;
         }
 
                 
         // TODO
-        // 插入时overlaps 处理区间重叠矛盾 删除
-        for (int j = 0; j < indect_pointer; j++) {
+        // 插入时overlaps 处理区间重叠矛盾时 状态为 仍存在重叠0 或者 旧段被新段完全覆盖-1, 的这些段需要删除
+        for (int j = indect_pointer - 1; j >= 0; j--) {
             Group_del_segments(group, level, indices_to_delete[j]);
             // del group->L[level].segment[j];
         }
 
     }
 
-    // Todo 如果添加段时出现区间重叠，则将旧段往下层推，如果在下层还是重叠，则为该段创建新的Level
+    //  如果添加段时出现区间重叠，处理后准太则将旧段往下层推，如果在下层还是重叠，则为该段创建新的Level
     if (recursive) {
         if (confict_segs.num_segments != 0) {
+            //femu_log("将 %d 个重叠区间添加到 L[%d]\n", confict_segs.num_segments, level + 1);
             Group_add_segments(group, level + 1, confict_segs.segments, confict_segs.num_segments, false);
         }
     } else {
+        // 如果递归添加后仍重叠 则直接为这些重叠段建立新的L[level]索引水平L_i
         if (confict_segs.num_segments != 0) {
             Group_add_LogPLR(group);
             for (int i = 0; i < confict_segs.num_segments; i++) {
@@ -756,22 +870,45 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
             }       
         }
     }
-    return ;
 
+    femu_log("[Group_add_segments]: out\n");
+    return ;
 }
 
 void Group_update(Group *group, Point* points, int num_points) {
     // Points 应该是已经排序好的 lpa : ppa
     //double gamma = 0;
 
+    // femu_log("[Group_update]: in\n");
     plr__init(&group->plr);
     plr_learn(&group->plr, points, num_points);
     plr_sorted(&group->plr);
     
-    Group_add_segments(group, 0, group->plr.segments, group->plr.num_segments, false);  // should be true
-     
-    plr_destroy(&group->plr);
+    femu_log("[Group_update]: plr学习完成, num_segments:%d\n", group->plr.num_segments);
+    
+    // print
+    if (0 && DeBUG) {
+        for (int i = 0; i < group->plr.num_segments; i++) {
+            Segment seg = group->plr.segments[i];
+            femu_log("[Group_update][plr_Segment %d]: k: %.2f, b: %.2f, x1: %u, x2: %u, %s, %s\n", i,
+                seg.k, seg.b, seg.x1, seg.x2, seg.accurate ? "精确":"不精确", seg.consecutive ? "连续":"不连续");
+        }
+    }
+    Group_add_segments(group, 0, group->plr.segments, group->plr.num_segments, true);  // should be true
 
+    
+    if (0 && DeBUG) {
+        femu_log("[Group_update]: 此次segs索引段添加到group完成, 此时的group[%d]信息如下:\n", group->group_id);
+        for (int i = 0; i < group->num_levels; i++) {
+            for (int j = 0; j < group->L[i].num_segments; j++) {
+                Segment seg = group->L[i].segments[j];
+                femu_log("[Group_update] group[%d]->L[%d][Segment %d]: k: %.2f, b: %.2f, x1: %u, x2: %u, %s, %s\n", group->group_id, 
+                i, j, seg.k, seg.b, seg.x1, seg.x2, seg.accurate ? "精确":"不精确", seg.consecutive ? "连续":"不连续");            
+            }
+        }
+    }
+    plr_destroy(&group->plr);
+    // femu_log("[Group_update]: out\n");
 }
 
 // no use
@@ -790,8 +927,13 @@ void FrameGroup_init(FrameGroup *framegroup, double gamma) {
     
     framegroup->counter.group_write_hit = 0;
     framegroup->counter.group_write_miss = 0;
-    
-    framegroup->num_groups = framegroup->frame_length;
+    framegroup->cnt_groups = 0;
+
+    // framegroup->num_groups = framegroup->frame_length;
+    // framegroup->num_groups = 16 * 1024 * 1024; // 2^32 / 2^8 = 2^24 3B
+    // 16 GB / 4KB = 4M = 4 * 1024 * 1024 = 4194304
+    framegroup->num_groups = 4 * 4 * 1024;  // 不太对上面那样算 是4G的条目 下面是按照8MB的映射表大小计算
+
     framegroup->groups = (Group *)malloc(framegroup->num_groups * sizeof(Group));
     for (int i = 0; i < framegroup->num_groups; i++) {
         Group_init(&framegroup->groups[i], framegroup->gamma, i);
@@ -810,26 +952,49 @@ void FrameGroup_update(FrameGroup *framegroup, Point* points, int num_points) {
         spt.pos_split[i] = -1;
     }
 
+    femu_log("[FrameGroup_update]: num_points:%d\n", num_points);
     for (int i = 0; i < num_points; i++) {
-        uint32_t split_id = points[i].x / framegroup->num_groups;
-        uint32_t split_lpa = points[i].x % framegroup->frame_length;
+        uint32_t split_id = points[i].x / framegroup->frame_length;
+        uint8_t split_lpa = points[i].x % framegroup->frame_length;   // 好像不用
         uint32_t split_ppa = points[i].y;
 
+        if (0 && DeBUG) {
+            femu_log("[FrameGroup_update]: [LOOP %d] num_split:%d, point.x: %u, split_LPA: %u, split_id: %u\n", 
+                        i, spt.num_split, points[i].x, split_lpa, split_id);
+        }
+
+        if (split_id >= framegroup->num_groups) {
+            femu_log("[FrameGroup_update]: lba范围溢出\n");
+            continue;
+        }
+        
         if (spt.pos_split[split_id] != -1) {
             int pos = spt.pos_split[split_id];
             spt.s_points[pos].points[spt.s_points[pos].num_points].x = split_lpa;
             spt.s_points[pos].points[spt.s_points[pos].num_points].y = split_ppa;
             spt.s_points[pos].num_points++;
         } else {
-            spt.s_points = (Points *)realloc(spt.s_points, (spt.num_split + 1) * sizeof(Points));
-            spt.s_points[spt.num_split].num_points = 0;
-            spt.s_points[spt.num_split].split_id = split_id;
-            spt.s_points[spt.num_split].points[spt.s_points[spt.num_split].num_points].x = split_lpa;
-            spt.s_points[spt.num_split].points[spt.s_points[spt.num_split].num_points].y = split_ppa;
-            spt.s_points[spt.num_split].num_points++;
-            
-            spt.pos_split[split_id] = spt.num_split;
-            spt.num_split++;
+            if (spt.s_points == NULL) {
+                spt.s_points = (Points *)malloc((spt.num_split + 1) * sizeof(Points));
+                spt.s_points[spt.num_split].num_points = 0;
+                spt.s_points[spt.num_split].split_id = split_id;
+                spt.s_points[spt.num_split].points[0].x = split_lpa;
+                spt.s_points[spt.num_split].points[0].y = split_ppa;
+                spt.s_points[spt.num_split].num_points++;
+                
+                spt.pos_split[split_id] = spt.num_split;
+                spt.num_split++;                
+            } else {
+                spt.s_points = (Points *)realloc(spt.s_points, (spt.num_split + 1) * sizeof(Points));
+                spt.s_points[spt.num_split].num_points = 0;
+                spt.s_points[spt.num_split].split_id = split_id;
+                spt.s_points[spt.num_split].points[0].x = split_lpa;
+                spt.s_points[spt.num_split].points[0].y = split_ppa;
+                spt.s_points[spt.num_split].num_points++;
+                
+                spt.pos_split[split_id] = spt.num_split;
+                spt.num_split++;
+            }
             //spt.st[split_id] = true;
             
         }
@@ -838,18 +1003,66 @@ void FrameGroup_update(FrameGroup *framegroup, Point* points, int num_points) {
         Point *s_points = spt.s_points[i].points;
         int num_s_points = spt.s_points[i].num_points;
         int group_id = spt.s_points[i].split_id;
-
+        //femu_log("-----------[FrameGroup_update]: spt.num_split:%d------------\n", i);
         Group_update(&framegroup->groups[group_id], s_points, num_s_points);
     }
     free(spt.s_points);
     free(spt.pos_split);
+    femu_log("[FrameGroup_update]: end !!!!!!!\n");
 }
 
 void FrameGroup_static(FrameGroup *framegroup) {
+    uint32_t num = 0, cnt = 0;
     for (int i = 0; i < framegroup->num_groups; i++) {
         for (int j = 0; j < framegroup->groups[i].num_levels; j++) {
-            framegroup->num_segments += framegroup->groups[i].L[j].num_segments;   
+            num += framegroup->groups[i].L[j].num_segments;   
+            cnt ++;
         }
     }
-    femu_log("[FrameGroup_static]:总共的学习索引段数量: %d\n", framegroup->num_segments);    
+    framegroup->num_segments = num;
+    framegroup->cnt_groups   = cnt;
+    femu_log("[FrameGroup_static]: 误差范围: %.1f, framegroup->cnt_groups: %d, 总共的学习索引段数量: %d\n", 
+                                    framegroup->gamma, framegroup->cnt_groups, framegroup->num_segments);    
+}
+
+uint64_t FrameGroup_lookup(FrameGroup *framegroup, uint64_t lpn, Segment *seg)
+{
+    uint32_t group_id = lpn / framegroup->frame_length;
+    uint8_t find_lpa = lpn % framegroup->frame_length;   // 好像不用
+    uint64_t ppa = 0;
+
+    if (group_id >= framegroup->num_groups) {
+        femu_log("[FrameGroup_lookup]: lba范围溢出\n");
+        return ppa;
+    }
+    Group group = framegroup->groups[group_id];
+    for (int i = 0; i < group.num_levels; i++) {
+        LogPLR logplr = group.L[i];
+        Segment find_seg;
+        Segment_init(&find_seg, 0, 0, find_lpa, find_lpa, NULL, 0);
+        int pos = 0;
+        // 第一个大于等于tar的位置
+        pos = binary_search(&logplr, &find_seg);
+        if (pos == 0 || (pos < logplr.num_segments && logplr.segments[pos].x1 == find_lpa))
+            pos = pos;
+        else 
+            pos -= 1;
+        find_seg = logplr.segments[pos];
+
+        ppa = Segment_gety(&find_seg, true, find_lpa);
+        if (ppa == 0) {
+            femu_log("group[%d]->L[%d] 未找到 lpa: %u\n", group.group_id, i, find_lpa);
+            continue;
+        } else {
+            // TODO
+            // 如果是不精确的还得先检查CRB
+            *seg = find_seg;
+            break;
+        }
+    }
+    if (ppa == 0) {
+        femu_log("group[%d]上未找到对于 lpn: %lu的写入信息\n", group.group_id, lpn);
+    }
+
+    return ppa;
 }
