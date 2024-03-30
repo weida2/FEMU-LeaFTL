@@ -6,6 +6,7 @@
         "chrono": "c",
         "cmath": "c",
         "*.inc": "c",
-        "math.h": "c"
+        "math.h": "c",
+        "string_view": "c"
     }
 }

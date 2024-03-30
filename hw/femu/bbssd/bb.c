@@ -75,7 +75,15 @@ static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
         break;   
     case FEMU_Group_Static:
         FrameGroup_static(&ssd->l_maptbl);
-        femu_log("%s,LeaFTL_Write Static Succesfully!\n", n->devname);
+        // FrameGroup_init(&ssd->l_maptbl, error_bound);
+        // FrameGroup_static(&ssd->l_maptbl);
+        // for (int i = 0; i < WB_Entries + 2; i++) {
+        //         ssd->WB[i].LPA = 0;
+        //         ssd->WB[i].PPA = 0;
+        //     }
+        // ssd->num_write_entries = 0;  
+              
+        femu_log("%s,LeaFTL_Write Static and clear Succesfully!\n", n->devname);
         break;
     case FEMU_DISABLE_LEAWRITE:
         ssd->enable_leaftl_write = false;

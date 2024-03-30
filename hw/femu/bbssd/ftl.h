@@ -4,14 +4,14 @@
 #include "../nvme.h"
 
 #include "leaftl.h"
-#define  error_bound 20   // 误差范围
+#define  error_bound 0   // 误差范围
 // #include "test.hpp"
 
 #define INVALID_PPA     (~(0ULL))
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
 
-#define WB_Entries      1024
+#define WB_Entries      1024 
 // 1k * 4KB = 4MB 假设SSD内写入缓冲区的大小为 4MB 可以缓存1k条lpa：ppa条目
 
 enum {
@@ -162,6 +162,9 @@ struct ssdparams {
     int pgs_per_line;
     int blks_per_line;
     int tt_lines;
+
+    int pls_per_line;
+    int luns_per_line;
 
     int pls_per_ch;   /* # of planes per channel */
     int tt_pls;       /* total # of planes in the SSD */

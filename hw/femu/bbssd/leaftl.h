@@ -159,8 +159,11 @@ typedef struct Group    {
  */
 
 typedef struct Counter {
-    int group_write_miss;
-    int group_write_hit;
+    int group_read_cnt;
+    int group_read_acc_hit;
+    int group_reaa_noacc_hit;
+    int group_read_noacc_miss;
+    int group_read_miss;
 }Counter;
 
 

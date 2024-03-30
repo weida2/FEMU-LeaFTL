@@ -54,8 +54,56 @@ static inline struct ppa pgidx2ppa(struct ssd *ssd, uint64_t pgidx)
     ppa.g.pg = (pgidx - ppa.g.ch * spp->pgs_per_ch - ppa.g.lun * spp->pgs_per_lun - 
                 ppa.g.pl  * spp->pgs_per_pl - ppa.g.blk * spp->pgs_per_blk);
 
-
     ftl_assert(pgidx < spp->tt_pgs);
+
+    return ppa;
+}
+
+static uint64_t ppa2vpgidx(struct ssd *ssd, struct ppa *ppa)
+{
+    struct ssdparams *spp = &ssd->sp;
+    uint64_t vpgidx;
+
+    // pgidx = ppa->g.ch  * spp->pgs_per_ch  + 
+    //         ppa->g.lun * spp->pgs_per_lun + 
+    //         ppa->g.pl  * spp->pgs_per_pl  + 
+    //         ppa->g.blk * spp->pgs_per_blk + 
+    //         ppa->g.pg;
+
+    
+    vpgidx = ppa->g.blk * spp->pgs_per_line  + \
+             ppa->g.pg  * spp->blks_per_line + \
+             ppa->g.pl  * spp->luns_per_line + \
+             ppa->g.lun * spp->nchs          + \
+             ppa->g.ch;
+
+    ftl_assert(vpgidx < spp->tt_pgs);
+
+    return vpgidx;
+}
+
+static inline struct ppa vpgidx2ppa(struct ssd *ssd, uint64_t vpgidx)
+{
+    struct ssdparams *spp = &ssd->sp;
+    struct ppa ppa;
+    ppa.ppa = 0;
+    // ppa.g.ch = pgidx / spp->pgs_per_ch;
+    // ppa.g.lun = (pgidx - ppa.g.ch * spp->pgs_per_ch) / spp->pgs_per_lun;
+    // ppa.g.pl = (pgidx - ppa.g.ch * spp->pgs_per_ch - ppa.g.lun * spp->pgs_per_lun) / spp->pgs_per_pl;
+    // ppa.g.blk = (pgidx - ppa.g.ch * spp->pgs_per_ch - ppa.g.lun * spp->pgs_per_lun - 
+    //             ppa.g.pl  * spp->pgs_per_pl) / spp->pgs_per_blk;
+    // ppa.g.pg = (pgidx - ppa.g.ch * spp->pgs_per_ch - ppa.g.lun * spp->pgs_per_lun - 
+    //             ppa.g.pl  * spp->pgs_per_pl - ppa.g.blk * spp->pgs_per_blk);
+
+    ppa.g.blk = vpgidx / spp->pgs_per_line;
+    ppa.g.pg  = (vpgidx - ppa.g.blk * spp->pgs_per_line) / spp->blks_per_line;
+    ppa.g.pl  = (vpgidx - ppa.g.blk * spp->pgs_per_line - ppa.g.pg * spp->blks_per_line) / spp->luns_per_line;
+    ppa.g.lun = (vpgidx - ppa.g.blk * spp->pgs_per_line - ppa.g.pg * spp->blks_per_line -
+                 ppa.g.pl * spp->luns_per_line) / spp->nchs;
+    ppa.g.ch  = (vpgidx - ppa.g.blk * spp->pgs_per_line - ppa.g.pg * spp->blks_per_line -
+                 ppa.g.pl * spp->luns_per_line - ppa.g.lun * spp->nchs);
+
+    ftl_assert(vpgidx < spp->tt_pgs);
 
     return ppa;
 }
@@ -196,6 +244,7 @@ static void ssd_advance_write_pointer(struct ssd *ssd)
             if (wpp->pg == spp->pgs_per_blk) {
                 wpp->pg = 0;
                 /* move current line to {victim,full} line list */
+                // 超级块写满了
                 if (wpp->curline->vpc == spp->pgs_per_line) {
                     /* all pgs are still valid, move to full line list */
                     ftl_assert(wpp->curline->ipc == 0);
@@ -205,6 +254,7 @@ static void ssd_advance_write_pointer(struct ssd *ssd)
                     ftl_assert(wpp->curline->vpc >= 0 && wpp->curline->vpc < spp->pgs_per_line);
                     /* there must be some invalid pages in this line */
                     ftl_assert(wpp->curline->ipc > 0);
+                    // 将超级块放到gc victim优先队列中
                     pqueue_insert(lm->victim_line_pq, wpp->curline);
                     lm->victim_line_cnt++;
                 }
@@ -289,13 +339,23 @@ static void ssd_init_params(struct ssdparams *spp)
     spp->pls_per_ch =  spp->pls_per_lun * spp->luns_per_ch;
     spp->tt_pls = spp->pls_per_ch * spp->nchs;
 
-    spp->tt_luns = spp->luns_per_ch * spp->nchs;
+    spp->tt_luns = spp->luns_per_ch * spp->nchs;  // 16GB  8 * 8 = 64
 
     /* line is special, put it at the end */
-    spp->blks_per_line = spp->tt_luns; /* TODO: to fix under multiplanes */
+    spp->blks_per_line = spp->tt_luns * 1; /* TODO: to fix under multiplanes */ // no多通道 plane = 1
     spp->pgs_per_line = spp->blks_per_line * spp->pgs_per_blk;
     spp->secs_per_line = spp->pgs_per_line * spp->secs_per_pg;
     spp->tt_lines = spp->blks_per_lun; /* TODO: to fix under multiplanes */
+
+    // super_block == line
+    // 32 GB
+    spp->luns_per_line = spp->nchs * spp->luns_per_ch;          // 64
+
+    spp->pls_per_line = spp->luns_per_line * spp->pls_per_lun;  // 64 
+    spp->blks_per_line = spp->pls_per_line;                     // 64 (blks_per_line = pages_per_superpagd) 
+
+    spp->pgs_per_line = spp->blks_per_line * spp->pgs_per_blk;  // 64 * 512 = 32768 
+
 
     spp->gc_thres_pcent = 0.75;
     spp->gc_thres_lines = (int)((1 - spp->gc_thres_pcent) * spp->tt_lines);
@@ -777,6 +837,7 @@ static int do_gc(struct ssd *ssd, bool force)
               ssd->lm.free_line_cnt);
 
     /* copy back valid data */
+    // superblok level clean block
     for (ch = 0; ch < spp->nchs; ch++) {
         for (lun = 0; lun < spp->luns_per_ch; lun++) {
             ppa.g.ch = ch;
@@ -786,6 +847,7 @@ static int do_gc(struct ssd *ssd, bool force)
             clean_one_block(ssd, &ppa);
             mark_block_free(ssd, &ppa);
 
+            // 擦除时间
             if (spp->enable_gc_delay) {
                 struct nand_cmd gce;
                 gce.type = GC_IO;
@@ -882,10 +944,13 @@ static uint64_t ssd_lea_read(struct ssd *ssd, NvmeRequest *req)
         ret_ppa = FrameGroup_lookup(&ssd->l_maptbl, lpn, &seg);
         uint64_t etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         femu_log("[lookup]lpN:%lu -> ppA:%lu, et-st:%lu ns\n", lpn, ret_ppa, etime - stime);
+        ssd->l_maptbl.counter.group_read_cnt++;
+
         if (!ret_ppa) {
             //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
             //printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
             //ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
+            ssd->l_maptbl.counter.group_read_miss++;
             continue;
         }
         else if (!valid_lpn(ssd, ret_ppa)) {
@@ -897,12 +962,16 @@ static uint64_t ssd_lea_read(struct ssd *ssd, NvmeRequest *req)
                 femu_log("seg不精确,寻找ppa: %lu 对应的oob\n", ret_ppa);
                 uint64_t ed = (uint64_t)ssd->l_maptbl.gamma;
                 uint64_t y;
+                // uint64_t t_ppa;
+                // struct ppa tmp_ppa = vpgidx2ppa(ssd, ret_ppa);
+                // t_ppa = ppa2pgidx(ssd, &tmp_ppa);
+
                 for (y = 0; y <= ed; y++) {
-                    uint64_t i = ret_ppa - y, j = ret_ppa + y;
+                    uint64_t i = ret_ppa - y, j = ret_ppa + y;  
                     if (ssd->rmap[i] == lpn || ssd->rmap[j] == lpn) {
                         if (y == 0) {
-                            femu_log("预测精确,原来 ppa: %lu -> oob.lpa: %lu,\n", ret_ppa, lpn);
-                            ppa = pgidx2ppa(ssd, ret_ppa);
+                            femu_log("预测精确,直接读 ppa: %lu -> oob.lpa: %lu,\n", ret_ppa, lpn);
+                            ppa = vpgidx2ppa(ssd, ret_ppa);
                             struct nand_cmd srd;
                             srd.type = USER_IO;
                             srd.cmd = NAND_READ;
@@ -910,9 +979,9 @@ static uint64_t ssd_lea_read(struct ssd *ssd, NvmeRequest *req)
                             sublat = ssd_advance_status(ssd, &ppa, &srd);
                             maxlat = (sublat > maxlat) ? sublat : maxlat;
                         } else {
-                            femu_log("预测错误，需要双读,原来 ppa: %lu -> oob.lpa: %lu,\n       实际ppa: %lu -> oob.lpa: %lu\n ", ret_ppa, ssd->rmap[ret_ppa],
+                            femu_log("预测错误，需要双读,第一次读 ppa: %lu -> oob.lpa: %lu,\n\t\t第二次读ppa: %lu -> oob.lpa: %lu\n ", ret_ppa, ssd->rmap[ret_ppa],
                                     ssd->rmap[i] == lpn ? i : j, lpn);
-                            ppa = pgidx2ppa(ssd, ret_ppa);
+                            ppa = vpgidx2ppa(ssd, ret_ppa);
                             struct nand_cmd srd;
                             srd.type = USER_IO;
                             srd.cmd = NAND_READ;
@@ -921,22 +990,23 @@ static uint64_t ssd_lea_read(struct ssd *ssd, NvmeRequest *req)
                             maxlat = (sublat > maxlat) ? sublat : maxlat;
                             
                             ret_ppa = ssd->rmap[i] == lpn ? i : j;
-                            ppa = pgidx2ppa(ssd, ret_ppa);
+                            ppa = vpgidx2ppa(ssd, ret_ppa);
                             sublat = ssd_advance_status(ssd, &ppa, &srd);
                             maxlat = (sublat > maxlat) ? sublat : maxlat;
                         }
-
+                        ssd->l_maptbl.counter.group_reaa_noacc_hit++;
                         break;
                     } 
                 }
                 if (y > ed) {
                     femu_log("查找失败,寻找 ppa: %lu 的oob空间未找到对应的lpn: %lu\n", ret_ppa, lpn);
+                    ssd->l_maptbl.counter.group_read_noacc_miss++;
                     // TODO 未作处理
                 }
             } else {
+                ssd->l_maptbl.counter.group_read_acc_hit++;
                 femu_log("seg精确,直接读取 lpn: %lu -> flash_ppa: %lu \n", lpn, ret_ppa);
-
-                ppa = pgidx2ppa(ssd, ret_ppa);
+                ppa = vpgidx2ppa(ssd, ret_ppa);
                 struct nand_cmd srd;
                 srd.type = USER_IO;
                 srd.cmd = NAND_READ;
@@ -1053,10 +1123,11 @@ static uint64_t ssd_lea_write(struct ssd *ssd, NvmeRequest *req)
             for (int i = 0; i < n; i++) {
                 PPA = get_new_page(ssd);
                 TPPA[i] = PPA;
-                uint64_t pgidx = ppa2pgidx(ssd, &PPA);
-                ssd->WB[i].PPA = pgidx;
+                uint64_t vpgidx = ppa2vpgidx(ssd, &PPA);
+                ssd->WB[i].PPA = vpgidx;
 
-                set_rmap_ent(ssd, ssd->WB[i].LPA, &PPA);
+                // set_rmap_ent(ssd, ssd->WB[i].LPA, &PPA);
+                ssd->rmap[vpgidx] = ssd->WB[i].LPA;
 
                 ssd_advance_write_pointer(ssd);
             }
