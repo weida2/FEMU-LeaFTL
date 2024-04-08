@@ -233,6 +233,9 @@ struct ssd {
     bool enable_leaftl_read;
     bool flush; 
 
+    uint64_t *o_maptbl;
+ 
+
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;
     struct rte_ring **to_poller;

@@ -88,7 +88,7 @@ typedef struct SimpleSegment {
 
 typedef struct Segs {
     Segment *segments;
-    int segment_id[20];
+    int segment_id[256];
     int num_segments;
 } Segs;
 
@@ -137,7 +137,7 @@ typedef struct LogPLR{
     uint8_t  level;
 
     Segment *segments;
-    uint8_t num_segments;
+    int num_segments;
 
 } LogPLR;
 
@@ -147,6 +147,7 @@ typedef struct Group    {
 
     LogPLR *L;  
     int num_levels;
+    int max_levels;
 
     int group_id;
 
@@ -182,7 +183,8 @@ typedef struct FrameGroup {
      
 
     // method
-
+    uint64_t o_maptbl_cnt;
+    
 } FrameGroup;
 
 
@@ -244,7 +246,7 @@ void plr_learn(PLR* plr, Point* points, int num_points);
 void plr_sorted(PLR* plr);
 
 void LogPLR_init(LogPLR *logplr, int level);
-int8_t binary_search(LogPLR *logplr, Segment *seg);
+int32_t binary_search(LogPLR *logplr, Segment *seg);
 void LogPLR_add_segment(LogPLR *logplr, Segment *seg, int *index);
 void LogPLR_del_segment(LogPLR *logplr, int pos);
 

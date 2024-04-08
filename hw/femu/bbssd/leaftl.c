@@ -407,7 +407,7 @@ void plr_init(PLR* plr, double gamma) {
 // Tem_struct, use for build segments, and then destry after insert LSM struc
 void plr__init(PLR* plr) {
 
-  //  plr_destroy(plr);
+    // plr_destroy(plr);
 
     plr->segments = g_malloc0(sizeof(Segment) * (plr->max_length));
     for (int i = 0; i < plr->max_length; i++) {
@@ -514,7 +514,7 @@ int process_point(PLR* plr, Point* point, Segment *seg) {
             plr->sint.x = 0, plr->sint.y = 0;
             plr->state = PLR_CONSTANTS_SECOND;
 
-            femu_log("[process_pt]: 段学习完成, 总共点数:%d\n", plr->num_points);
+            //femu_log("[process_pt]: 段学习完成, 总共点数:%d\n", plr->num_points);
             free(plr->points);
             plr->points = NULL;
             plr->num_points = 0;
@@ -541,7 +541,7 @@ int process_point(PLR* plr, Point* point, Segment *seg) {
             plr->sint.x = 0, plr->sint.y = 0;
             plr->state = PLR_CONSTANTS_SECOND;
 
-            femu_log("[process_pt]: 段学习完成, 总共点数:%d\n", plr->num_points);
+            //femu_log("[process_pt]: 段学习完成, 总共点数:%d\n", plr->num_points);
             free(plr->points);
             plr->points = NULL;
             plr->num_points = 0;
@@ -592,7 +592,7 @@ void plr_learn(PLR* plr, Point* points, int num_points) {
     Segment final_seg;
     Segment_init(&final_seg, 0, 0, 0, 0, NULL, 0);
     int ret = build_segment(plr, &final_seg);
-    femu_log("[process_pt]: 段学习完成, 总共点数:%d\n", plr->num_points);
+   //femu_log("[process_pt]: 段学习完成, 总共点数:%d\n", plr->num_points);
     if (ret) {
            // femu_log("[plr_learn]: 学习成功后添加段(最后的段)\n");
             plr_add_segment(plr, &final_seg);
@@ -634,14 +634,15 @@ void LogPLR_init(LogPLR *logplr, int level) {
     logplr->level = level;
     logplr->segments = NULL;
     logplr->num_segments = 0;
+    logplr->max_length = 256;
 }
 
 
 // debug tmp use -> uint32_t target
-int8_t binary_search(LogPLR *logplr, Segment *seg) {
-    int8_t left = 0;
-    int8_t right = logplr->num_segments - 1;
-    int8_t mid = 0;
+int32_t binary_search(LogPLR *logplr, Segment *seg) {
+    int32_t left = 0;
+    int32_t right = logplr->num_segments - 1;
+    int32_t mid = 0;
     uint32_t target = seg->x1;
     while (left <= right) {
         mid = left + (right - left) / 2;
@@ -671,15 +672,21 @@ void LogPLR_add_segment(LogPLR *logplr, Segment *seg, int *index) {
         logplr->num_segments++; 
         *index = 0;
     } else {
-        logplr->segments = (Segment *)realloc(logplr->segments, (logplr->num_segments + 1) * sizeof(Segment));
-        // 二分查找插入位置
-        uint8_t pos = binary_search(logplr, seg);
-        *index = pos;
-        logplr->num_segments++;
-        for (int i = logplr->num_segments - 1; i >= pos + 1; i--) {
-            logplr->segments[i] = logplr->segments[i - 1];
+        if (logplr->num_segments < logplr->max_length - 1) {
+            logplr->segments = (Segment *)realloc(logplr->segments, (logplr->num_segments + 1) * sizeof(Segment));
+            // 二分查找插入位置
+            int32_t pos = binary_search(logplr, seg);
+            *index = pos;
+            logplr->num_segments++;
+            for (int i = logplr->num_segments - 1; i >= pos + 1; i--) {
+                logplr->segments[i] = logplr->segments[i - 1];
+            }
+            logplr->segments[pos] = *seg;
+        } else {
+            int32_t pos = binary_search(logplr, seg);
+            *index = pos;
+            logplr->segments[pos] = *seg;            
         }
-        logplr->segments[pos] = *seg;
     }
 }
 
@@ -741,6 +748,7 @@ void Group_init(Group *group, double gamma, int group_id) {
     plr_init(&group->plr, gamma);
     group->L = NULL;
     group->num_levels = 0;
+    group->max_levels = 256;
 
     group->group_id = group_id;
 }
@@ -765,6 +773,10 @@ void Group_del_segments(Group *group, int level, int pos) {
 void Group_add_segments(Group *group, int level, Segment *segments, int num_segments, bool recursive) {
 
     //femu_log("[Group_add_segments]: in\n");
+    if (group->num_levels >= group->max_levels) {
+        femu_log("[Group_add_segments]:group[%d]->num_levels overflow\n", group->group_id);
+        return ;
+    }
 
     while (group->num_levels <= level) {
         Group_add_LogPLR(group);
@@ -793,14 +805,14 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
         if (index != 0) {
             // 在前面的最多只有一个重叠
             // Segs_add_segment 处理重复段函数
-            if (group->L[level].segments[index].x1 < group->L[level].segments[index - 1].x2) {
+            if (group->L[level].segments[index].x1 <= group->L[level].segments[index - 1].x2) {
                 Segs_add_segment(&overlap_segs, &group->L[level].segments[index - 1], index - 1);
             }
         }
         // overlap_segs.numsegs = 1;
         for (int j = index + 1; j < group->L[level].num_segments; j++) {
             // 添加后续的重叠区间段
-            if (group->L[level].segments[j].x1 >= segments[i].x2) {
+            if (group->L[level].segments[j].x1 > segments[i].x2) {
                 break;
             }
             Segs_add_segment(&overlap_segs, &group->L[level].segments[j], j);            
@@ -811,7 +823,7 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
             femu_log("group[%d]->L[%d] 目前重叠段数为: %d\n", group->group_id, level, overlap_segs.num_segments);
         }
 
-        uint8_t indices_to_delete[50];
+        uint8_t indices_to_delete[256];
         int     indect_pointer = 0;
 
         for (int j = 0; j < overlap_segs.num_segments; j++) {
@@ -878,7 +890,11 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
             }       
         }
     }
-
+    if (confict_segs.segments != NULL) {
+        free(confict_segs.segments);
+        confict_segs.num_segments = 0;
+        confict_segs.segments = NULL;
+    }
     femu_log("[Group_add_segments]: out\n");
     return ;
 }
@@ -944,7 +960,8 @@ void FrameGroup_init(FrameGroup *framegroup, double gamma) {
     // framegroup->num_groups = framegroup->frame_length;
     // framegroup->num_groups = 16 * 1024 * 1024; // 2^32 / 2^8 = 2^24 3B
     // 16 GB / 4KB = 4M = 4 * 1024 * 1024 = 4194304
-    framegroup->num_groups = 4 * 4 * 1024;  // 不太对上面那样算 是4G的条目 下面是按照8MB的映射表大小计算
+    // 64 GB = 16 * 1024 * 1024 => ngroups = 16 * 4 * 1024
+    framegroup->num_groups = 16 * 4 * 1024;  // 不太对上面那样算 是4G的条目 下面是按照8MB的映射表大小计算 
 
     framegroup->groups = (Group *)malloc(framegroup->num_groups * sizeof(Group));
     for (int i = 0; i < framegroup->num_groups; i++) {
@@ -998,6 +1015,7 @@ void FrameGroup_update(FrameGroup *framegroup, Point* points, int num_points) {
                 spt.num_split++;                
             } else {
                 spt.s_points = (Points *)realloc(spt.s_points, (spt.num_split + 1) * sizeof(Points));
+                
                 spt.s_points[spt.num_split].num_points = 0;
                 spt.s_points[spt.num_split].split_id = split_id;
                 spt.s_points[spt.num_split].points[0].x = split_lpa;
@@ -1011,6 +1029,8 @@ void FrameGroup_update(FrameGroup *framegroup, Point* points, int num_points) {
             
         }
     }
+    femu_log("出来了\n");
+
     for (int i = 0; i < spt.num_split; i++) {
         Point *s_points = spt.s_points[i].points;
         int num_s_points = spt.s_points[i].num_points;
@@ -1033,8 +1053,8 @@ void FrameGroup_static(FrameGroup *framegroup) {
     }
     framegroup->num_segments = num;
     framegroup->cnt_groups   = cnt;
-    femu_log("[FrameGroup_static]: 误差范围: %.1f, framegroup->cnt_groups: %d, 总共的学习索引段数量: %d\n", 
-                                    framegroup->gamma, framegroup->cnt_groups, framegroup->num_segments);
+    femu_log("[FrameGroup_static]: 误差范围: %.1f, framegroup->cnt_groups: %d, 总共的学习索引段数量: %d, o_maptbl: %lu\n", 
+                                    framegroup->gamma, framegroup->cnt_groups, framegroup->num_segments, framegroup->o_maptbl_cnt);
     femu_log("[FrameGroup_static][lea_read]: cnt: %d, lac_hit: %d, nac_hit: %d, nac_miss: %d, miss: %d\n", 
                                     framegroup->counter.group_read_cnt, 
                                     framegroup->counter.group_read_acc_hit, framegroup->counter.group_reaa_noacc_hit,
@@ -1067,7 +1087,7 @@ uint64_t FrameGroup_lookup(FrameGroup *framegroup, uint64_t lpn, Segment *seg)
 
         ppa = Segment_gety(&find_seg, true, find_lpa);
         if (ppa == 0) {
-            femu_log("group[%d]->L[%d] 未找到 lpa: %u\n", group.group_id, i, find_lpa);
+           // femu_log("group[%d]->L[%d] 未找到 lpa: %u\n", group.group_id, i, find_lpa);
             continue;
         } else {
             // TODO
@@ -1077,7 +1097,7 @@ uint64_t FrameGroup_lookup(FrameGroup *framegroup, uint64_t lpn, Segment *seg)
         }
     }
     if (ppa == 0) {
-        femu_log("group[%d]上未找到对于 lpn: %lu的写入信息\n", group.group_id, lpn);
+       // femu_log("group[%d]上未找到对于 lpn: %lu的写入信息\n", group.group_id, lpn);
     }
 
     return ppa;
