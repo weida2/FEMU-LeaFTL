@@ -4,7 +4,8 @@
 #include "../nvme.h"
 
 #include "leaftl.h"
-#define  error_bound 0   // 误差范围
+
+#define  error_bound 1   // 误差范围
 // #include "test.hpp"
 
 #define INVALID_PPA     (~(0ULL))
@@ -233,8 +234,6 @@ struct ssd {
     bool enable_leaftl_read;
     bool flush; 
 
-    uint64_t *o_maptbl;
- 
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;

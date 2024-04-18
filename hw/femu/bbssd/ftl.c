@@ -214,6 +214,7 @@ static struct line *get_next_free_line(struct ssd *ssd)
 
     curline = QTAILQ_FIRST(&lm->free_line_list);
     if (!curline) {
+        FrameGroup_static(&ssd->l_maptbl);
         ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
         return NULL;
     }
@@ -444,11 +445,16 @@ static void ssd_init_rmap(struct ssd *ssd)
 
 static void ssd_init_o_maptbl(struct ssd *ssd) {
     struct ssdparams *spp = &ssd->sp;
-    ssd->o_maptbl = g_malloc0(sizeof(uint64_t) * spp->tt_pgs);
+    ssd->l_maptbl.o_maptbl = g_malloc0(sizeof(uint64_t) * spp->tt_pgs);
     for (int i = 0; i < spp->tt_pgs; i++) {
-        ssd->o_maptbl[i] = 0;
+        ssd->l_maptbl.o_maptbl[i] = 0;
     }
-    ssd->l_maptbl.o_maptbl_cnt = 0;     
+    ssd->l_maptbl.o_maptbl_cnt = 0;
+    ssd->l_maptbl.o_maptbl_hit = 0;
+
+    ssd->l_maptbl.o_maptbl_maxLBA = 0;
+    ssd->l_maptbl.o_maptbl_minLBA = 16777216; // 64GB
+    
 }
 
 void ssd_init(FemuCtrl *n)
@@ -877,7 +883,8 @@ static int do_gc(struct ssd *ssd, bool force)
 
     return 0;
 }
-
+fd = fopen(da,)
+fwrite(fd, 0, 100); -> lpa: 0, 100
 static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 {
     struct ssdparams *spp = &ssd->sp;
@@ -902,6 +909,7 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
             //ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
             continue;
         }
+        ppa = dftl_get(tbl, lpn, *lpa)
 
         struct nand_cmd srd;
         srd.type = USER_IO;
@@ -938,6 +946,13 @@ static uint64_t ssd_lea_read(struct ssd *ssd, NvmeRequest *req)
         }
     }
 
+    // 统计 验证
+    for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        if (ssd->l_maptbl.o_maptbl[lpn] == 1) {
+            ssd->l_maptbl.o_maptbl_hit++;
+        }
+    }
+
 
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
@@ -955,7 +970,7 @@ static uint64_t ssd_lea_read(struct ssd *ssd, NvmeRequest *req)
         uint64_t stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         ret_ppa = FrameGroup_lookup(&ssd->l_maptbl, lpn, &seg);
         uint64_t etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-        femu_log("[lookup_cost]LA:%lu -> PA:%lu, et-st:%lu ns\n", lpn, ret_ppa, etime - stime);
+      //  femu_log("[lookup_cost]LA:%lu -> PA:%lu, et-st:%lu ns\n", lpn, ret_ppa, etime - stime);
         ssd->l_maptbl.counter.group_read_cnt++;
 
         if (!ret_ppa) {
@@ -1007,8 +1022,10 @@ static uint64_t ssd_lea_read(struct ssd *ssd, NvmeRequest *req)
                             ppa = vpgidx2ppa(ssd, ret_ppa);
                             sublat = ssd_advance_status(ssd, &ppa, &srd);
                             maxlat = (sublat > maxlat) ? sublat : maxlat;
+                            ssd->l_maptbl.counter.group_double_read++;
+
                         }
-                        ssd->l_maptbl.counter.group_reaa_noacc_hit++;
+                        ssd->l_maptbl.counter.group_read_noacc_hit++;
                         break;
                     } 
                 }
@@ -1107,24 +1124,91 @@ static uint64_t ssd_lea_write(struct ssd *ssd, NvmeRequest *req)
 
     // 统计
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-        if (ssd->o_maptbl[lpn] == 0) {
-            ssd->o_maptbl[lpn] = 1;
+        if (ssd->l_maptbl.o_maptbl[lpn] == 0) {
+            ssd->l_maptbl.o_maptbl[lpn] = 1;
             ssd->l_maptbl.o_maptbl_cnt++;
+            if (ssd->l_maptbl.o_maptbl_maxLBA < lpn) ssd->l_maptbl.o_maptbl_maxLBA = lpn;
+            if (ssd->l_maptbl.o_maptbl_minLBA > lpn) ssd->l_maptbl.o_maptbl_minLBA = lpn;
         }
     }
 
     // 模拟写入并分配ppa然后计算闪存时延,
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
 
-        // leaFTL logic
         ssd->WB[ssd->num_write_entries].LPA = lpn;
         ssd->WB[ssd->num_write_entries].PPA = 0;
 
         ssd->num_write_entries++;
-      //  femu_log("lea_write [1]\n");
         //缓冲区写满后 排序LPA然后分配PBA 之后学习索引
         if (ssd->num_write_entries == WB_Entries) {
 
+            uint64_t stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+            int n = ssd->num_write_entries;
+            for (int i = 0; i < n - 1; i++) {
+                for (int j = 0; j < n - i - 1; j++) {
+                    if (ssd->WB[j].LPA > ssd->WB[j + 1].LPA) {
+                        struct Write_Buffer temp;
+                        temp = ssd->WB[j];
+                        ssd->WB[j] = ssd->WB[j + 1];
+                        ssd->WB[j + 1] = temp;
+                    }
+                }
+            }
+            
+            struct ppa PPA;
+
+            struct ppa TPPA[1030];
+            for (int i = 0; i < n; i++) {
+                PPA = get_new_page(ssd);
+                TPPA[i] = PPA;
+                uint64_t vpgidx = ppa2vpgidx(ssd, &PPA);
+                ssd->WB[i].PPA = vpgidx;
+                // set_rmap_ent(ssd, ssd->WB[i].LPA, &PPA);
+                ssd->rmap[vpgidx] = ssd->WB[i].LPA;
+
+                ssd_advance_write_pointer(ssd);
+
+                ssd->l_maptbl.counter.group_write_cnt++;
+            }
+
+            Point *points = (Point *)(ssd->WB);
+            
+            if (0 && DeBUG) {
+                femu_log("[ssd_lea_write]:排序后LPA-PPA信息\n");
+                for (int i = 0; i < n; i++) {
+                    femu_log("lpa:%u -> ppa:%u\n", points[i].x, points[i].y);
+                }
+            }
+           // femu_log("ssd_lea_write, 准备开始更新\n");
+            FrameGroup_update(&ssd->l_maptbl, points, n);
+           // femu_log("ssd_lea_write, 索引更新结束\n");
+
+            uint64_t etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+           // femu_log("[training_cost]stime:%lu, etime:%lu, et-st:%lu ns\n", stime, etime, etime - stime);
+           // FrameGroup_static(&ssd->l_maptbl);
+            for (int i = 0; i < WB_Entries + 2; i++) {
+                ssd->WB[i].LPA = 0;
+                ssd->WB[i].PPA = 0;
+            }
+            ssd->num_write_entries = 0;
+
+            // simulator lat            
+            for (int i = 0; i < n; i++) {
+                struct nand_cmd swr;
+                swr.type = USER_IO;
+                swr.cmd = NAND_WRITE;
+                swr.stime = req->stime;
+                /* get latency statistics */
+                curlat = ssd_advance_status(ssd, &TPPA[i], &swr);
+                maxlat = (curlat > maxlat) ? curlat : maxlat;
+            }
+           // maxlat = (n * NAND_PROG_LATENCY * 10000) / (spp->nchs * spp->luns_per_ch);
+        }
+
+
+        // 不满也刷 好像是最后一次刷
+        if (0 && ssd->flush) {
             uint64_t stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
             // femu_log("lea_write [2]\n");
 
@@ -1157,7 +1241,7 @@ static uint64_t ssd_lea_write(struct ssd *ssd, NvmeRequest *req)
 
             Point *points = (Point *)(ssd->WB);
             
-            if (1 && DeBUG) {
+            if (0 && DeBUG) {
                 femu_log("[ssd_lea_write]:排序后LPA-PPA信息\n");
                 for (int i = 0; i < n; i++) {
                     femu_log("lpa:%u -> ppa:%u\n", points[i].x, points[i].y);
@@ -1168,7 +1252,7 @@ static uint64_t ssd_lea_write(struct ssd *ssd, NvmeRequest *req)
             femu_log("ssd_lea_write, 索引更新结束\n");
 
             uint64_t etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-            femu_log("stime:%lu, etime:%lu, et-st:%lu ns\n", stime, etime, etime - stime);
+            femu_log("[training_cost]stime:%lu, etime:%lu, et-st:%lu ns\n", stime, etime, etime - stime);
            // FrameGroup_static(&ssd->l_maptbl);
             for (int i = 0; i < WB_Entries + 2; i++) {
                 ssd->WB[i].LPA = 0;
@@ -1189,72 +1273,6 @@ static uint64_t ssd_lea_write(struct ssd *ssd, NvmeRequest *req)
            // maxlat = (n * NAND_PROG_LATENCY * 10000) / (spp->nchs * spp->luns_per_ch);
         }
 
-
-        // 不满也刷 好像是最后一次刷
-        if (ssd->flush) {
-            uint64_t stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-            //  femu_log("lea_write [2]\n");
-
-            int n = ssd->num_write_entries;
-            for (int i = 0; i < n - 1; i++) {
-                for (int j = 0; j < n - i - 1; j++) {
-                    if (ssd->WB[j].LPA > ssd->WB[j + 1].LPA) {
-                        struct Write_Buffer temp;
-                        temp = ssd->WB[j];
-                        ssd->WB[j] = ssd->WB[j + 1];
-                        ssd->WB[j + 1] = temp;
-                    }
-                }
-            }
-            
-            struct ppa PPA;
-
-            struct ppa TPPA[1030];
-            for (int i = 0; i < n; i++) {
-
-                PPA = get_new_page(ssd);
-                TPPA[i] = PPA;
-                uint64_t pgidx = ppa2pgidx(ssd, &PPA);
-                ssd->WB[i].PPA = pgidx;
-                
-                ssd_advance_write_pointer(ssd);
-            }
-
-            Point *points = (Point *)(ssd->WB);
-            
-            if (0 && DeBUG) {
-                femu_log("[ssd_lea_write]:排序后LPA-PPA信息\n");
-                for (int i = 0; i < n; i++) {
-                    femu_log("lpa:%u -> ppa:%u\n", points[i].x, points[i].y);
-                }
-            }
-            femu_log("ssd_lea_write, 准备开始更新\n");
-            FrameGroup_update(&ssd->l_maptbl, points, n);
-            femu_log("ssd_lea_write, 索引更新结束\n");
-
-            uint64_t etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-            femu_log("stime:%lu, etime:%lu, et-st:%lu ns\n", stime, etime, etime - stime);
-            //FrameGroup_static(&ssd->l_maptbl);
-            for (int i = 0; i < WB_Entries + 2; i++) {
-                ssd->WB[i].LPA = 0;
-                ssd->WB[i].PPA = 0;
-            }
-            ssd->num_write_entries = 0;
-
-            // simulator lat            
-            for (int i = 0; i < n; i++) {
-                struct nand_cmd swr;
-                swr.type = USER_IO;
-                swr.cmd = NAND_WRITE;
-                swr.stime = req->stime;
-                /* get latency statistics */
-                curlat = ssd_advance_status(ssd, &TPPA[i], &swr);
-                maxlat = (curlat > maxlat) ? curlat : maxlat;
-            }
-
-            // 0延迟
-            // maxlat = (curlat > maxlat) ? curlat : maxlat;
-        } 
     }     
     return maxlat;
 }

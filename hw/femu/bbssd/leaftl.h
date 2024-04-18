@@ -1,9 +1,9 @@
 #ifndef __FEMU_LeaFTL_H
 #define __FEMU_LeaFTL_H
 
-#include "../nvme.h"
 #include <math.h>
 #include <stdlib.h>
+#include "../nvme.h"
 
 #define MB *1024*1024
 #define KB *1024
@@ -18,10 +18,10 @@
 #define L_MAX(a, b) ((a) > (b) ? (a) : (b))
 #define DeBUG 1
 
-typedef struct LRUCache {
-    int size;
-    int maxsize;
-}LRUCache;   // todo 
+// typedef struct LRUCache {
+//     int size;
+//     int maxsize;
+// }LRUCache;   // todo 
 
 typedef struct Point {
     uint32_t x;        // lpn
@@ -31,7 +31,7 @@ typedef struct Point {
 
 // no use
 typedef struct Points {
-    Point points[256];
+    Point points[1024];
     int num_points;
     int split_id;
 } Points;
@@ -65,6 +65,7 @@ typedef union {
 typedef struct Bitmap {
     int length;
     unsigned char *bitmap;
+    unsigned char *bitmap_upper;
 } Bitmap;
 
 
@@ -88,7 +89,7 @@ typedef struct SimpleSegment {
 
 typedef struct Segs {
     Segment *segments;
-    int segment_id[256];
+    int segment_id[Write_Buffer_Entries];
     int num_segments;
 } Segs;
 
@@ -143,7 +144,7 @@ typedef struct LogPLR{
 
 typedef struct Group    {
     double gamma;
-    PLR plr;    // 专门用来学习段,之后插日志结构LogPLR, (用来学习索引段的临时数据结构，临时工)
+    PLR plr;                    // 专门用来学习段,之后插日志结构LogPLR, (用来学习索引段的临时数据结构，临时工)
 
     LogPLR *L;  
     int num_levels;
@@ -160,10 +161,12 @@ typedef struct Group    {
  */
 
 typedef struct Counter {
+    int group_write_cnt;
     int group_read_cnt;
     int group_read_acc_hit;
-    int group_reaa_noacc_hit;
+    int group_read_noacc_hit;
     int group_read_noacc_miss;
+    int group_double_read;
     int group_read_miss;
 }Counter;
 
@@ -183,8 +186,14 @@ typedef struct FrameGroup {
      
 
     // method
+    uint64_t *o_maptbl;
     uint64_t o_maptbl_cnt;
-    
+    uint64_t o_maptbl_hit;
+
+    uint64_t o_maptbl_maxLBA; 
+    uint64_t o_maptbl_minLBA;
+
+
 } FrameGroup;
 
 
@@ -215,8 +224,9 @@ void crb_init(CRB *crb);
 void crb_insert_segment(CRB *crb, Segment* seg);
 unsigned int crb_find_segment(CRB *crb, uint8_t lpa);
 
-bool Segment_is_valid(Segment *seg, uint32_t x);
+int Segment_is_valid(Segment *seg, uint32_t x);
 uint32_t Segment_gety(Segment *seg, bool check, uint32_t x);
+uint32_t Segment_gety_upper(Segment *seg, bool check, uint32_t x);
 int isConsecutive(Point *points, int num_points);
 void Segment_check_properties(Segment *seg, Point *points, int num_points);
 void Segment_init(Segment *seg, double k, double b, int x1, int x2, Point *points, int num_points);
@@ -260,7 +270,7 @@ void Group_add_LogPLR(Group *group);
 void Group_del_segments(Group *group, int level, int pos);
 void Group_add_segments(Group *group, int level, Segment *segments, int num_segments, bool recursive);
 void Group_update(Group *group, Point* points, int num_points);
-LRUCache *createLRUCache(int maxsize);
+// LRUCache *createLRUCache(int maxsize);
 void FrameGroup_init(FrameGroup *framegroup, double gamma);
 void FrameGroup_static(FrameGroup *framegroup);
 void FrameGroup_update(FrameGroup *framegroup, Point* points, int num_points);

@@ -81,14 +81,14 @@ unsigned int crb_find_segment(CRB *crb, uint8_t lpa) {
 
 
 // 可能出现bug
-bool Segment_is_valid(Segment *seg, uint32_t x) {
+int Segment_is_valid(Segment *seg, uint32_t x) {
     if (!(x >= seg->x1 && x <= seg->x2))
-        return false;
+        return 0;
     if (seg->accurate) {
         int k = round(1.0/seg->k);
         if (k != 0) {
-            if (((x - seg->x1) % k) != 0)        
-                return false;
+            if (((x - seg->x1) % k) != 0)
+                return 0;
         } else {
             // TODO
         }
@@ -99,7 +99,7 @@ bool Segment_is_valid(Segment *seg, uint32_t x) {
         if (seg->filter.length > 0 && (x - seg->x1) <= seg->filter.length) 
             return seg->filter.bitmap[x - seg->x1];
     }
-    return true;
+    return 1;
 }
 
 
@@ -108,6 +108,17 @@ uint32_t Segment_gety(Segment *seg, bool check, uint32_t x) {
     int predict = 0;
     if (!check || Segment_is_valid(seg, x)) {
             predict = (int)(x*seg->k + seg->b);
+            return predict;
+    }
+    return predict;
+}
+
+uint32_t Segment_gety_upper(Segment *seg, bool check, uint32_t x) {
+    int predict = 0;
+    if (!check || Segment_is_valid(seg, x)) {
+            int pos = seg->filter.bitmap_upper[x - seg->x1];
+            if (pos == 1) predict = (int)(x*seg->k + seg->b);
+            else predict = round(x*seg->k + seg->b);
             return predict;
     }
     return predict;
@@ -167,14 +178,27 @@ void Segment_init(Segment *seg, double k, double b, int x1, int x2, Point *point
             }
             seg->filter.length = seg->x2 - seg->x1 + 1;
             seg->filter.bitmap = (unsigned char *)malloc(seg->filter.length * sizeof(unsigned char));
+            seg->filter.bitmap_upper = (unsigned char *)malloc(seg->filter.length * sizeof(unsigned char));
             memset(seg->filter.bitmap, 0, seg->filter.length * sizeof(unsigned char));
-            
+            memset(seg->filter.bitmap_upper, 0, seg->filter.length * sizeof(unsigned char));
+
             if (seg->filter.bitmap != NULL) {
                 memset(seg->filter.bitmap, 0, seg->filter.length * sizeof(unsigned char));
-            
                 for (int i = 0; i < num_points; i++) {
                     seg->filter.bitmap[points[i].x - seg->x1] = 1;
-                }
+                } 
+            }
+            if (seg->filter.bitmap_upper != NULL) {
+                memset(seg->filter.bitmap_upper, 0, seg->filter.length * sizeof(unsigned char));
+                for (int i = 0; i < num_points; i++) {
+                    uint32_t ppa;
+                    ppa = Segment_gety(seg, false, points[i].x);
+                    if (ppa >= points[i].y) {
+                        seg->filter.bitmap_upper[points[i].x - seg->x1] = 1;
+                    } else {
+                        seg->filter.bitmap_upper[points[i].x - seg->x1] = 2;
+                    } 
+                }                
             }
         }
     }
@@ -187,19 +211,14 @@ bool Segment_overlaps(Segment *seg1, Segment *seg2) {
 
 // may has a bug // fix
 void Segment_merge(Segment *new_seg, Segment *old_seg, int *samelevel) {
-    //原本就不重叠
-    // 但是这个条件的话应该不会进入这个循环中
     if (!old_seg || !old_seg->k || !old_seg->x1 || !old_seg->filter.bitmap) {
         *samelevel = 2;
         return;
     }
 
-    if (new_seg->x1 >= old_seg->x2 || new_seg->x2 <= old_seg->x1) {
-        *samelevel = 2;  
-        return ;
-    } 
     //else if (new_seg->consecutive)  no use new_seg->consecutive
-    if (0 && DeBUG) femu_log("new_seg.x1: %u, x2: %u, old_seg.x1: %u, old_seg.x2: %u\n", new_seg->x1, new_seg->x2, old_seg->x1, old_seg->x2);
+    if (0 && DeBUG) femu_log("new_seg.x1: %u, x2: %u, old_seg.x1: %u, old_seg.x2: %u\n", 
+                                    new_seg->x1, new_seg->x2, old_seg->x1, old_seg->x2);
 
     int start = L_MIN(new_seg->x1, old_seg->x1);
     int end   = L_MAX(new_seg->x2, old_seg->x2);
@@ -278,7 +297,7 @@ void Segment_merge(Segment *new_seg, Segment *old_seg, int *samelevel) {
         }
     }
     old_seg->x1 = first_valid + start;
-    old_seg->x2 = last_valid  + start;  // 存在bug,在这里对old_seg处理,只是在overlap_segs中的old_seg做处理,
+    old_seg->x2 = last_valid  + start;  // 在这里对old_seg处理,只是在overlap_segs中的old_seg做处理,
                                         // 并没有对原来的logplr中的segs中的old_seg做处理
 
 
@@ -287,7 +306,7 @@ void Segment_merge(Segment *new_seg, Segment *old_seg, int *samelevel) {
         j++;
     }
 
-    if (new_seg->x1 >= old_seg->x2 || new_seg->x2 <= old_seg->x1) {
+    if (new_seg->x1 > old_seg->x2 || new_seg->x2 < old_seg->x1) {
         *samelevel = 1;  // 存在不重叠
         return ;
     }     
@@ -398,7 +417,7 @@ SimpleSegment frompoints_insec(InsecPoint p1, Point p2) {
  */
 void plr_init(PLR* plr, double gamma) {
     plr->gamma = gamma;
-    plr->max_length = 256;
+    plr->max_length = Write_Buffer_Entries;
 
     plr__init(plr);
 }
@@ -413,6 +432,7 @@ void plr__init(PLR* plr) {
     for (int i = 0; i < plr->max_length; i++) {
         Segment_init(&plr->segments[i], 0, 0, 0, 0, NULL, 0);
     }
+    plr->num_segments = 0;
 
     plr->s0.x = 0, plr->s0.y = 0;   // init point
     plr->s1.x = 0, plr->s1.y = 0;
@@ -428,15 +448,17 @@ void plr__init(PLR* plr) {
 
 
 void plr_add_segment(PLR *plr, Segment *seg) {
-    if (plr->num_segments == 0) {
-        plr->segments = (Segment *)malloc(1 * sizeof(Segment));
-        plr->segments[0] = *seg;  // C语言结构浅拷贝,有可能出bug
-        plr->num_segments++; 
-    } else {
-        plr->segments = (Segment *)realloc(plr->segments, (plr->num_segments + 1) * sizeof(Segment));
-        plr->segments[plr->num_segments] = *seg;
-        plr->num_segments++;
-    }    
+    // if (plr->num_segments == 0) {
+    //     plr->segments = (Segment *)malloc(1 * sizeof(Segment));
+    //     plr->segments[0] = *seg;  // C语言结构浅拷贝,有可能出bug
+    //     plr->num_segments++; 
+    // } else {
+    //     plr->segments = (Segment *)realloc(plr->segments, (plr->num_segments + 1) * sizeof(Segment));
+    //     plr->segments[plr->num_segments] = *seg;
+    //     plr->num_segments++;
+    // }
+    plr->segments[plr->num_segments % plr->max_length] = *seg;
+    plr->num_segments++;  
 }
 
 void plr_destroy(PLR* plr) {
@@ -488,13 +510,13 @@ int build_segment(PLR* plr, Segment *seg) {
 bool should_stop(PLR* plr, Point *point) {
     if (plr->s1.x == 0) {
         if (point->x > plr->s0.x + plr->max_length || point->x <= plr->s0.x) return true;  // 段的横向长度
-    }else if (point->x > plr->s1.x + plr->max_length || point->x <= plr->s0.x) return true;
+    }else if (point->x > plr->s1.x + plr->max_length || point->x <= plr->s1.x) return true;
 
     return false;
 }
 
 
-// 处理点的函数,up and lower 有界误差范围的线性回归学习
+// up and lower 有界误差范围的线性回归学习
 int process_point(PLR* plr, Point* point, Segment *seg) {
 
    // femu_log("[process_point]: in\n");
@@ -571,12 +593,7 @@ int process_point(PLR* plr, Point* point, Segment *seg) {
     return ret;
 }
 
-// 学习得到一堆学习索引段 存在PLR中 还没有日志结构
 void plr_learn(PLR* plr, Point* points, int num_points) {
-    // plr_init(plr);
-    //Segment* rejs = malloc(num_points * sizeof(Segment));
-    //int num_rejs = 0;
-
     // femu_log("[plr_learn]: in\n");
 
     for (int i = 0; i < num_points; i++) {
@@ -638,33 +655,27 @@ void LogPLR_init(LogPLR *logplr, int level) {
 }
 
 
-// debug tmp use -> uint32_t target
+// fix: 寻找大于等于target的右半区的左边界点
 int32_t binary_search(LogPLR *logplr, Segment *seg) {
     int32_t left = 0;
     int32_t right = logplr->num_segments - 1;
     int32_t mid = 0;
-    uint32_t target = seg->x1;
-    while (left <= right) {
-        mid = left + (right - left) / 2;
+    int32_t target = seg->x1;
+    while (left < right) {
+        mid = (left + right) >> 1;
         //femu_log("[begin] left:%u, right:%u, mid:%u\n",left, right, mid);
-        if (logplr->segments[mid].x1 == target) {
-            // 如果找到目标元素，则直接返回其索引
-            return mid;
-        } else if (logplr->segments[mid].x1 < target) {
-            // 如果目标元素大于中间元素，则在右半部分继续查找
-            left = mid + 1;
+        if (logplr->segments[mid].x1 >= target) {
+            right = mid;
         } else {
-            right = mid - 1;
+            left = mid + 1;
         }
-       // femu_log("[end] left:%u, right:%u, mid:%u\n",left, right, mid);
+       // fprintf("[end] left:%u, right:%u, mid:%u\n",left, right, mid);
     }
-    // 当循环结束时，说明目标元素在数组中不存在
-    // 此时，left表示应该插入的位置
     return left;
 }
 
 // L_i添加段
-// 如果释放掉PLR之后，LogPLR中的段会不会也不见？涉及到C语言结构的浅拷贝
+// 如果释放掉PLR之后，LogPLR中的段不会不见 C语言结构的浅拷贝
 void LogPLR_add_segment(LogPLR *logplr, Segment *seg, int *index) {
     if (logplr->num_segments == 0) {
         logplr->segments = (Segment *)malloc(1 * sizeof(Segment));
@@ -672,22 +683,23 @@ void LogPLR_add_segment(LogPLR *logplr, Segment *seg, int *index) {
         logplr->num_segments++; 
         *index = 0;
     } else {
-        if (logplr->num_segments < logplr->max_length - 1) {
-            logplr->segments = (Segment *)realloc(logplr->segments, (logplr->num_segments + 1) * sizeof(Segment));
-            // 二分查找插入位置
-            int32_t pos = binary_search(logplr, seg);
+        logplr->segments = (Segment *)realloc(logplr->segments, (logplr->num_segments + 1) * sizeof(Segment));
+        // 二分查找插入位置,永远是右半区的最左边界
+        int32_t pos = binary_search(logplr, seg);
+        if (pos == logplr->num_segments - 1 && seg->x1 > logplr->segments[pos].x1) {
+            pos = logplr->num_segments;
+            *index = pos;
+            logplr->num_segments++;
+            logplr->segments[pos] = *seg;
+        } else {
             *index = pos;
             logplr->num_segments++;
             for (int i = logplr->num_segments - 1; i >= pos + 1; i--) {
                 logplr->segments[i] = logplr->segments[i - 1];
             }
-            logplr->segments[pos] = *seg;
-        } else {
-            int32_t pos = binary_search(logplr, seg);
-            *index = pos;
-            logplr->segments[pos] = *seg;            
-        }
-    }
+            logplr->segments[pos] = *seg;          
+        }   
+    }   
 }
 
 void LogPLR_del_segment(LogPLR *logplr, int pos) {
@@ -774,8 +786,9 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
 
     //femu_log("[Group_add_segments]: in\n");
     if (group->num_levels >= group->max_levels) {
-        femu_log("[Group_add_segments]:group[%d]->num_levels overflow\n", group->group_id);
-        return ;
+        // TODO
+        // Compact合并
+        femu_log("[Group_add_segments]:group[%d]->num_levels: %d, overflow!!!\n", group->group_id, group->num_levels);
     }
 
     while (group->num_levels <= level) {
@@ -789,9 +802,21 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
 
     // femu_log("[Group_add_segments]: num_segments:%d, %s递归添加\n", num_segments, recursive ? "是" : "不是");
     for (int i = 0; i < num_segments; i++) {
-     //   Segment *seg = &segments[i];
         //femu_log("segment:[%d].x1 = %u, add to level: L%d\n", i,segments[i].x1, level);
         int index = 0;
+
+        // debug
+        if (group->L[level].num_segments >= group->L[level].max_length) {
+            // TODO 替换策略 继续添加统计段
+            femu_log("[Group_add_segments]:g[%d]->L[%d].num_segs: %d, error 超出最大值! \n", group->group_id, level, group->L[level].num_segments);
+
+            if (group->L[level].num_segments >= 1024) {
+                break;
+            }
+            //break;
+            
+        }
+
         if (group->L[level].num_segments == 0) {
             LogPLR_add_segment(&group->L[level], &segments[i], &index);
             continue;
@@ -799,7 +824,7 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
         Segs overlap_segs;
         overlap_segs.num_segments = 0;
         overlap_segs.segments = NULL;
-        memset(overlap_segs.segment_id, 0, 20 * sizeof(int));
+        memset(overlap_segs.segment_id, 0, Write_Buffer_Entries * sizeof(int));
 
         LogPLR_add_segment(&group->L[level], &segments[i], &index);
         if (index != 0) {
@@ -809,7 +834,7 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
                 Segs_add_segment(&overlap_segs, &group->L[level].segments[index - 1], index - 1);
             }
         }
-        // overlap_segs.numsegs = 1;
+
         for (int j = index + 1; j < group->L[level].num_segments; j++) {
             // 添加后续的重叠区间段
             if (group->L[level].segments[j].x1 > segments[i].x2) {
@@ -823,7 +848,7 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
             femu_log("group[%d]->L[%d] 目前重叠段数为: %d\n", group->group_id, level, overlap_segs.num_segments);
         }
 
-        uint8_t indices_to_delete[256];
+        uint8_t indices_to_delete[Write_Buffer_Entries];
         int     indect_pointer = 0;
 
         for (int j = 0; j < overlap_segs.num_segments; j++) {
@@ -834,8 +859,6 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
             if (same_level == -1) {
                 indices_to_delete[indect_pointer++] = overlap_segs.segment_id[j]; 
             } else if (same_level == 0) {
-                // confict_segs在这里添加 此时recursive = true
-                //Segs_add_segment(&confict_segs, &overlap_segs.segments[j], 1);
                 
                 if (confict_segs.num_segments == 0) {
                     confict_segs.segments = (Segment *)malloc(1 * sizeof(Segment));
@@ -849,9 +872,11 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
 
                 indices_to_delete[indect_pointer++] = overlap_segs.segment_id[j];                   
             } else if (same_level == 1) {
-                // TODO
                 // 合并后不重叠此时应该处理原group->L[level].segments[j]的段
-                // 将overlap_segs.segments[j]段的值同步到g            roup->L[level].segments[j]的段的值中
+                // 将overlap_segs.segments[j]段的值同步到group->L[level].segments[j]的段的值中
+                int pos = overlap_segs.segment_id[j];
+                group->L[level].segments[pos] = overlap_segs.segments[j];
+
             } else if (same_level == 2) {
                 // 基本不会进入此个条件
             }
@@ -864,12 +889,10 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
             overlap_segs.segments = NULL;
         }
 
-                
-        // TODO
-        // 插入时overlaps 处理区间重叠矛盾时 状态为 仍存在重叠0 或者 旧段被新段完全覆盖-1, 的这些段需要删除
+        // 新段插入时overlaps重叠矛盾时立即处理, 状态为 仍存在重叠0 或者 旧段被新段完全覆盖-1, 的这些段需要删除
+        // 从尾往后删除
         for (int j = indect_pointer - 1; j >= 0; j--) {
             Group_del_segments(group, level, indices_to_delete[j]);
-            // del group->L[level].segment[j];
         }
 
     }
@@ -895,7 +918,7 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
         confict_segs.num_segments = 0;
         confict_segs.segments = NULL;
     }
-    femu_log("[Group_add_segments]: out\n");
+    // femu_log("[Group_add_segments]: out\n");
     return ;
 }
 
@@ -908,7 +931,7 @@ void Group_update(Group *group, Point* points, int num_points) {
     plr_learn(&group->plr, points, num_points);
     plr_sorted(&group->plr);
     
-    femu_log("[Group_update]: plr学习完成, num_segments:%d\n", group->plr.num_segments);
+   // femu_log("[Group_update]: plr学习完成, num_segments:%d\n", group->plr.num_segments);
     
     // print
     if (0 && DeBUG) {
@@ -949,11 +972,13 @@ void FrameGroup_init(FrameGroup *framegroup, double gamma) {
     framegroup->frame_length = 256;  // 1B maybe不够 frame_LBA_length
     framegroup->max_size = Mapping_TABLE_SIZE;
     
+    framegroup->counter.group_write_cnt = 0;
     framegroup->counter.group_read_cnt = 0;
     framegroup->counter.group_read_acc_hit = 0;
-    framegroup->counter.group_reaa_noacc_hit = 0;
+    framegroup->counter.group_read_noacc_hit = 0;
     framegroup->counter.group_read_miss = 0;
     framegroup->counter.group_read_noacc_miss = 0;
+    framegroup->counter.group_double_read = 0;
 
     framegroup->cnt_groups = 0;
 
@@ -981,7 +1006,7 @@ void FrameGroup_update(FrameGroup *framegroup, Point* points, int num_points) {
         spt.pos_split[i] = -1;
     }
 
-    femu_log("[FrameGroup_update]: num_points:%d\n", num_points);
+    //femu_log("[FrameGroup_update]: num_points:%d\n", num_points);
     for (int i = 0; i < num_points; i++) {
         uint32_t split_id = points[i].x / framegroup->frame_length;
         uint8_t split_lpa = points[i].x % framegroup->frame_length;   // 好像不用
@@ -1025,22 +1050,19 @@ void FrameGroup_update(FrameGroup *framegroup, Point* points, int num_points) {
                 spt.pos_split[split_id] = spt.num_split;
                 spt.num_split++;
             }
-            //spt.st[split_id] = true;
-            
         }
     }
-    femu_log("出来了\n");
 
     for (int i = 0; i < spt.num_split; i++) {
         Point *s_points = spt.s_points[i].points;
         int num_s_points = spt.s_points[i].num_points;
         int group_id = spt.s_points[i].split_id;
-        femu_log("-----------[FrameGroup_update]: spt.num_split:%d------------\n", i);
+        //femu_log("-----------[FrameGroup_update]: spt.num_split:%d------------\n", i);
         Group_update(&framegroup->groups[group_id], s_points, num_s_points);
     }
     free(spt.s_points);
     free(spt.pos_split);
-    femu_log("[FrameGroup_update]: end !!!!!!!\n");
+   // femu_log("[FrameGroup_update]: end !!!!!!!\n");
 }
 
 void FrameGroup_static(FrameGroup *framegroup) {
@@ -1051,20 +1073,27 @@ void FrameGroup_static(FrameGroup *framegroup) {
             cnt ++;
         }
     }
+    uint32_t o_cnt = 0;
+    for (int i = 0; i < framegroup->o_maptbl_maxLBA + 10; i++) {
+        if (framegroup->o_maptbl[i]) o_cnt++;
+    }
     framegroup->num_segments = num;
     framegroup->cnt_groups   = cnt;
-    femu_log("[FrameGroup_static]: 误差范围: %.1f, framegroup->cnt_groups: %d, 总共的学习索引段数量: %d, o_maptbl: %lu\n", 
-                                    framegroup->gamma, framegroup->cnt_groups, framegroup->num_segments, framegroup->o_maptbl_cnt);
-    femu_log("[FrameGroup_static][lea_read]: cnt: %d, lac_hit: %d, nac_hit: %d, nac_miss: %d, miss: %d\n", 
+    femu_log("[FrameGroup_static][lea_write]: 误差范围: %.1f, w_cnt: %d, framegroup->cnt_groups: %d, 总共的学习索引段数量: %d, o_maptbl: %lu, o_maptbl_maxLBA: %lu, o_maptbl_minLBA: %lu\n", 
+                                    framegroup->gamma, framegroup->counter.group_write_cnt,
+                                    framegroup->cnt_groups, framegroup->num_segments, 
+                                    o_cnt, framegroup->o_maptbl_maxLBA, framegroup->o_maptbl_minLBA);
+    femu_log("[FrameGroup_static][lea_read] : r_cnt: %d, lac_hit: %d, nac_hit: %d, nac_miss: %d, double_read: %d, omap_hit:%lu, miss: %d\n", 
                                     framegroup->counter.group_read_cnt, 
-                                    framegroup->counter.group_read_acc_hit, framegroup->counter.group_reaa_noacc_hit,
-                                    framegroup->counter.group_read_noacc_miss, framegroup->counter.group_read_miss);    
+                                    framegroup->counter.group_read_acc_hit, framegroup->counter.group_read_noacc_hit,
+                                    framegroup->counter.group_read_noacc_miss, framegroup->counter.group_double_read,
+                                    framegroup->o_maptbl_hit, framegroup->counter.group_read_miss);    
 }
 
 uint64_t FrameGroup_lookup(FrameGroup *framegroup, uint64_t lpn, Segment *seg)
 {
     uint32_t group_id = lpn / framegroup->frame_length;
-    uint8_t find_lpa = lpn % framegroup->frame_length;   // 好像不用
+    uint8_t find_lpa = lpn % framegroup->frame_length;   
     uint64_t ppa = 0;
 
     if (group_id >= framegroup->num_groups) {
@@ -1085,13 +1114,17 @@ uint64_t FrameGroup_lookup(FrameGroup *framegroup, uint64_t lpn, Segment *seg)
             pos -= 1;
         find_seg = logplr.segments[pos];
 
-        ppa = Segment_gety(&find_seg, true, find_lpa);
+        //ppa = Segment_gety(&find_seg, true, find_lpa);
+        // 上下取整预测
+        ppa = Segment_gety_upper(&find_seg, true, find_lpa);
+
         if (ppa == 0) {
            // femu_log("group[%d]->L[%d] 未找到 lpa: %u\n", group.group_id, i, find_lpa);
             continue;
         } else {
             // TODO
-            // 如果是不精确的还得先检查CRB
+            // 如果是不精确的还得先检查CRB 
+            // Check bit_map
             *seg = find_seg;
             break;
         }
