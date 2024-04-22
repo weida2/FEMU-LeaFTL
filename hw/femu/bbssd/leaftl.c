@@ -958,13 +958,6 @@ void Group_update(Group *group, Point* points, int num_points) {
     // femu_log("[Group_update]: out\n");
 }
 
-// no use
-LRUCache *createLRUCache(int maxsize) {
-    LRUCache* cache = g_malloc0(sizeof(LRUCache));
-    cache->maxsize = maxsize;
-    return cache;  
-}
-
 
 void FrameGroup_init(FrameGroup *framegroup, double gamma) {
     framegroup->gamma = gamma;

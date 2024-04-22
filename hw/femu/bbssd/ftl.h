@@ -4,6 +4,7 @@
 #include "../nvme.h"
 
 #include "leaftl.h"
+#include "dftl.h"
 
 #define  error_bound 1   // 误差范围
 // #include "test.hpp"
@@ -31,6 +32,13 @@ enum {
 };
 
 enum {
+    NORMAL_IO = 0,
+    LEAFTL_IO = 1,
+    DFTL_IO   = 2,
+
+};
+
+enum {
     SEC_FREE = 0,
     SEC_INVALID = 1,
     SEC_VALID = 2,
@@ -50,12 +58,10 @@ enum {
     FEMU_RESET_ACCT = 5,
     FEMU_ENABLE_LOG = 6,
     FEMU_DISABLE_LOG = 7,
-    FEMU_ENABLE_LEAWRITE  = 8,
-    FEMU_ENABLE_LEAREAD   = 9,
+    FEMU_ENABLE_LEAFTL_IO  = 8,
+    FEMU_ENABLE_DFTL_IO   = 9,
     FEMU_Group_Static     = 10,
-    FEMU_DISABLE_LEAWRITE = 11,
-    FEMU_DISABLE_LEAREAD  = 12,
-
+    FEMU_DFTL_Static      = 11,
 };
 
 
@@ -225,15 +231,19 @@ struct ssd {
     struct write_pointer wp;
     struct line_mgmt lm;
 
-
+    // leaftl.struct
     struct Write_Buffer WB[WB_Entries + 2];
     int    num_write_entries;
     int    hit_wb;
     FrameGroup l_maptbl;
-    bool enable_leaftl_write;
-    bool enable_leaftl_read;
     bool flush; 
 
+
+    // dftl.struct
+    DFTLTable* d_maptbl;
+
+    // IO api
+    int io_interface;
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;
@@ -243,6 +253,20 @@ struct ssd {
 };
 
 void ssd_init(FemuCtrl *n);
+struct ppa get_new_page(struct ssd *ssd);
+uint64_t ppa2vpgidx(struct ssd *ssd, struct ppa *ppa);
+void ssd_advance_write_pointer(struct ssd *ssd);
+
+
+// dftl.func 
+uint64_t dftl_get(DFTLTable *table, uint64_t lpa ,uint64_t* lat, struct ssd* ssd);
+void dftl_put(DFTLTable* table, uint64_t lpa, uint64_t ppa , uint64_t* lat, struct ssd* ssd);
+
+uint64_t lru_get(DFTLTable *d_maptbl, LRUCache *cache, uint64_t key, struct ssd* ssd);
+void lru_put(DFTLTable *d_maptbl, LRUCache *cache,LRUCache *nand_cache,uint64_t key, uint64_t value ,uint64_t*lat, struct ssd* ssd);
+
+Node *createNode(uint64_t page_idx, struct ssd* ssd);
+
 
 #ifdef FEMU_DEBUG_FTL
 #define ftl_debug(fmt, ...) \
