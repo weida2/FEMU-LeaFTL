@@ -7,6 +7,9 @@
         "cmath": "c",
         "*.inc": "c",
         "math.h": "c",
-        "string_view": "c"
+        "string_view": "c",
+        "dftl.h": "c",
+        "*.idef": "c",
+        "*.def": "c"
     }
 }

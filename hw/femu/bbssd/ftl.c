@@ -59,7 +59,7 @@ static inline struct ppa pgidx2ppa(struct ssd *ssd, uint64_t pgidx)
     return ppa;
 }
 
-static uint64_t ppa2vpgidx(struct ssd *ssd, struct ppa *ppa)
+uint64_t ppa2vpgidx(struct ssd *ssd, struct ppa *ppa)
 {
     struct ssdparams *spp = &ssd->sp;
     uint64_t vpgidx;
@@ -224,7 +224,7 @@ static struct line *get_next_free_line(struct ssd *ssd)
     return curline;
 }
 
-static void ssd_advance_write_pointer(struct ssd *ssd)
+void ssd_advance_write_pointer(struct ssd *ssd)
 {
     struct ssdparams *spp = &ssd->sp;
     struct write_pointer *wpp = &ssd->wp;
@@ -280,7 +280,7 @@ static void ssd_advance_write_pointer(struct ssd *ssd)
     }
 }
 
-static struct ppa get_new_page(struct ssd *ssd)
+struct ppa get_new_page(struct ssd *ssd)
 {
     struct write_pointer *wpp = &ssd->wp;
     struct ppa ppa;
@@ -484,14 +484,16 @@ void ssd_init(FemuCtrl *n)
     ssd_init_o_maptbl(ssd);
     ssd->num_write_entries = 0;
     ssd->flush = false;
-    ssd->enable_leaftl_write = false;
-
     for (int i = 0; i < WB_Entries + 2; i++) {
         ssd->WB[i].LPA = 0;
         ssd->WB[i].PPA = 0;
     }
-    ssd->num_write_entries = 0;  
     ssd->hit_wb = 0;
+
+    // 初始化 DFTLTable
+    ssd->d_maptbl = dftl_table_init(ssd->sp.tt_pgs);
+
+    ssd->io_interface = NORMAL_IO;
 
     /* initialize rmap */
     ssd_init_rmap(ssd);
@@ -883,8 +885,7 @@ static int do_gc(struct ssd *ssd, bool force)
 
     return 0;
 }
-fd = fopen(da,)
-fwrite(fd, 0, 100); -> lpa: 0, 100
+
 static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 {
     struct ssdparams *spp = &ssd->sp;
@@ -894,7 +895,7 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
     uint64_t start_lpn = lba / spp->secs_per_pg;
     uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_pg;
     uint64_t lpn;
-    uint64_t sublat, maxlat = 0;
+    uint64_t sublat = 0, maxlat = 0;
 
     if (end_lpn >= spp->tt_pgs) {
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
@@ -909,7 +910,6 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
             //ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
             continue;
         }
-        ppa = dftl_get(tbl, lpn, *lpa)
 
         struct nand_cmd srd;
         srd.type = USER_IO;
@@ -922,7 +922,62 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
     return maxlat;
 }
 
-// TODO
+static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
+{
+    uint64_t lba = req->slba;
+    struct ssdparams *spp = &ssd->sp;
+    int len = req->nlb;
+    uint64_t start_lpn = lba / spp->secs_per_pg;
+    uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
+    struct ppa ppa;
+    uint64_t lpn;
+    uint64_t curlat = 0, maxlat = 0;
+    int r;
+   // femu_log("[ssd_write]: in\n");
+
+    if (end_lpn >= spp->tt_pgs) {
+        ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
+    }
+
+    while (should_gc_high(ssd)) {  // 前台gc?
+        /* perform GC here until !should_gc(ssd) */ // 后台gc
+        r = do_gc(ssd, true);
+        if (r == -1)
+            break;
+    }
+
+    for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        ppa = get_maptbl_ent(ssd, lpn);
+        if (mapped_ppa(&ppa)) {
+            /* update old page information first */
+            mark_page_invalid(ssd, &ppa);
+            set_rmap_ent(ssd, INVALID_LPN, &ppa);
+        }
+
+        /* new write */
+        ppa = get_new_page(ssd);
+        /* update maptbl */
+        set_maptbl_ent(ssd, lpn, &ppa);
+        /* update rmap */
+        set_rmap_ent(ssd, lpn, &ppa);
+
+        mark_page_valid(ssd, &ppa);
+
+        /* need to advance the write pointer here */
+        ssd_advance_write_pointer(ssd);
+
+        struct nand_cmd swr;
+        swr.type = USER_IO;
+        swr.cmd = NAND_WRITE;
+        swr.stime = req->stime;
+        /* get latency statistics */
+        curlat = ssd_advance_status(ssd, &ppa, &swr);
+        maxlat = (curlat > maxlat) ? curlat : maxlat;
+    }
+
+    return maxlat;
+}
+
 static uint64_t ssd_lea_read(struct ssd *ssd, NvmeRequest *req)
 {
     struct ssdparams *spp = &ssd->sp;
@@ -954,7 +1009,7 @@ static uint64_t ssd_lea_read(struct ssd *ssd, NvmeRequest *req)
     }
 
 
-    /* normal IO read path */
+    /* leaFTL IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         Segment seg;
         
@@ -1053,64 +1108,6 @@ hit_wb:
     return maxlat;    
 }
 
-
-static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
-{
-    uint64_t lba = req->slba;
-    struct ssdparams *spp = &ssd->sp;
-    int len = req->nlb;
-    uint64_t start_lpn = lba / spp->secs_per_pg;
-    uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
-    struct ppa ppa;
-    uint64_t lpn;
-    uint64_t curlat = 0, maxlat = 0;
-    int r;
-   // femu_log("[ssd_write]: in\n");
-
-    if (end_lpn >= spp->tt_pgs) {
-        ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
-    }
-
-    while (should_gc_high(ssd)) {
-        /* perform GC here until !should_gc(ssd) */
-        r = do_gc(ssd, true);
-        if (r == -1)
-            break;
-    }
-
-    for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-        ppa = get_maptbl_ent(ssd, lpn);
-        if (mapped_ppa(&ppa)) {
-            /* update old page information first */
-            mark_page_invalid(ssd, &ppa);
-            set_rmap_ent(ssd, INVALID_LPN, &ppa);
-        }
-
-        /* new write */
-        ppa = get_new_page(ssd);
-        /* update maptbl */
-        set_maptbl_ent(ssd, lpn, &ppa);
-        /* update rmap */
-        set_rmap_ent(ssd, lpn, &ppa);
-
-        mark_page_valid(ssd, &ppa);
-
-        /* need to advance the write pointer here */
-        ssd_advance_write_pointer(ssd);
-
-        struct nand_cmd swr;
-        swr.type = USER_IO;
-        swr.cmd = NAND_WRITE;
-        swr.stime = req->stime;
-        /* get latency statistics */
-        curlat = ssd_advance_status(ssd, &ppa, &swr);
-        maxlat = (curlat > maxlat) ? curlat : maxlat;
-    }
-
-   // femu_log("[ssd_write]: out\n");
-    return maxlat;
-}
-
 static uint64_t ssd_lea_write(struct ssd *ssd, NvmeRequest *req)
 {
     uint64_t lba = req->slba;
@@ -1180,9 +1177,8 @@ static uint64_t ssd_lea_write(struct ssd *ssd, NvmeRequest *req)
                     femu_log("lpa:%u -> ppa:%u\n", points[i].x, points[i].y);
                 }
             }
-           // femu_log("ssd_lea_write, 准备开始更新\n");
+
             FrameGroup_update(&ssd->l_maptbl, points, n);
-           // femu_log("ssd_lea_write, 索引更新结束\n");
 
             uint64_t etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
            // femu_log("[training_cost]stime:%lu, etime:%lu, et-st:%lu ns\n", stime, etime, etime - stime);
@@ -1207,7 +1203,7 @@ static uint64_t ssd_lea_write(struct ssd *ssd, NvmeRequest *req)
         }
 
 
-        // 不满也刷 好像是最后一次刷
+        // 不满也刷 最后一次刷
         if (0 && ssd->flush) {
             uint64_t stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
             // femu_log("lea_write [2]\n");
@@ -1277,6 +1273,115 @@ static uint64_t ssd_lea_write(struct ssd *ssd, NvmeRequest *req)
     return maxlat;
 }
 
+static uint64_t ssd_dftl_read(struct ssd *ssd, NvmeRequest *req) {
+    struct ssdparams *spp = &ssd->sp;
+    uint64_t lba = req->slba;
+    int nsecs = req->nlb;
+
+    uint64_t start_lpn = lba / spp->secs_per_pg;
+    uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_pg;
+    uint64_t lpn;
+
+    uint64_t sublat, maxlat = 0;
+    uint64_t maptbl_lat = 0;
+    
+    struct ppa ppa;
+    uint64_t ret_ppa;
+
+    if (end_lpn >= spp->tt_pgs) {
+        ftl_log("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
+    }
+
+    /*  DFTL IO read path */
+    for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        ssd->d_maptbl->counter.group_read_cnt++;
+
+        ret_ppa = dftl_get(ssd->d_maptbl, lpn, &maptbl_lat, ssd);
+
+        if (ret_ppa == UNMAPPED_PPA) {
+            ssd->d_maptbl->counter.group_read_miss++;
+            continue;
+        }
+        else if (!valid_lpn(ssd, ret_ppa)) {
+            femu_log("Invalid ppA: %lu\n", ret_ppa);
+            continue;
+        }
+
+        ppa = vpgidx2ppa(ssd, ret_ppa);
+
+        struct nand_cmd srd;
+        srd.type = USER_IO;
+        srd.cmd = NAND_READ;
+        srd.stime = req->stime;
+        sublat = ssd_advance_status(ssd, &ppa, &srd);
+        maxlat = (sublat > maxlat) ? sublat : maxlat;
+    }
+
+    return maxlat + maptbl_lat;
+}
+
+static uint64_t ssd_dftl_write(struct ssd *ssd, NvmeRequest *req) {
+    struct ssdparams *spp = &ssd->sp;
+    uint64_t lba = req->slba;
+    int nsecs = req->nlb;
+
+    uint64_t start_lpn = lba / spp->secs_per_pg;
+    uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_pg;
+    uint64_t lpn;
+
+    uint64_t sublat = 0, maxlat = 0;
+    uint64_t maptbl_lat = 0;
+    
+    struct ppa ppa;
+    uint64_t ret_ppa;
+
+    if (end_lpn >= spp->tt_pgs) {
+        ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
+    }
+
+    // while (should_gc_high(ssd)) {  // 前台gc?
+    //     /* perform GC here until !should_gc(ssd) */ // 后台gc
+    //     int r = do_gc(ssd, true);
+    //     if (r == -1)
+    //         break;
+    // }
+
+    /*  DFTL IO write path */
+    for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+
+        // // this for gc
+        // ret_ppa = dftl_get(ssd->d_maptbl, lpn, &maptbl_lat, ssd);
+        // if (ret_ppa != UNMAPPED_PPA) {
+        //     ppa = vpgidx2ppa(ssd, ret_ppa);
+        //     /* update old page information first */
+        //     mark_page_invalid(ssd, &ppa);
+        //     set_rmap_ent(ssd, INVALID_LPN, &ppa);
+        // }
+
+        ssd->d_maptbl->counter.group_write_cnt++;
+
+        ppa = get_new_page(ssd);
+        uint64_t vpgidx = ppa2vpgidx(ssd, &ppa);
+        dftl_put(ssd->d_maptbl, lpn, vpgidx, &maptbl_lat, ssd);
+        ssd_advance_write_pointer(ssd);
+        // // this for gc
+        // set_rmap_ent(ssd, lpn, &ppa);
+        // mark_page_valid(ssd, &ppa);
+
+
+        struct nand_cmd swr;
+        swr.type = USER_IO;
+        swr.cmd = NAND_WRITE;
+        swr.stime = req->stime;
+        /* get latency statistics */
+        sublat = ssd_advance_status(ssd, &ppa, &swr);
+        maxlat = (sublat > maxlat) ? sublat : maxlat;        
+
+    }
+
+    return maxlat + maptbl_lat;
+}
+
 static void *ftl_thread(void *arg)
 {
     FemuCtrl *n = (FemuCtrl *)arg;
@@ -1305,20 +1410,24 @@ static void *ftl_thread(void *arg)
             }
 
             ftl_assert(req);
+            int type = ssd->io_interface;
             switch (req->cmd.opcode) {
             case NVME_CMD_WRITE:
-                if (!ssd->enable_leaftl_write) {
+                if (type == NORMAL_IO) {
                     lat = ssd_write(ssd, req);
-                } else {
+                } else if (type == LEAFTL_IO) {
                     lat = ssd_lea_write(ssd, req);
+                } else if (type == DFTL_IO) {
+                    lat = ssd_dftl_write(ssd, req);
                 }
                 break;
             case NVME_CMD_READ:
-                if (!ssd->enable_leaftl_read) {
+                if (type == NORMAL_IO) {
                     lat = ssd_read(ssd, req);
-                }
-                else {
+                } else if (type == LEAFTL_IO) {
                     lat = ssd_lea_read(ssd, req);
+                } else if (type == DFTL_IO) {
+                    lat = ssd_dftl_read(ssd, req);
                 }
                 break;
             case NVME_CMD_DSM:

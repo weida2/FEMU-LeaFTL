@@ -65,13 +65,13 @@ static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
         n->print_log = false;
         femu_log("%s,Log print [Disabled]!\n", n->devname);
         break;
-    case FEMU_ENABLE_LEAWRITE:
-        ssd->enable_leaftl_write = true;
-        femu_log("%s,LeaFTL_Write [enabled]!\n", n->devname);
+    case FEMU_ENABLE_LEAFTL_IO:
+        ssd->io_interface = LEAFTL_IO;
+        femu_log("%s,LeaFTL_IO [enabled]!\n", n->devname);
         break;
-    case FEMU_ENABLE_LEAREAD:
-        ssd->enable_leaftl_read = true;
-        femu_log("%s,LeaFTL_Read [enabled]!\n", n->devname);
+    case FEMU_ENABLE_DFTL_IO:
+        ssd->io_interface = DFTL_IO;
+        femu_log("%s,DFTL_IO [enabled]!\n", n->devname);
         break;   
     case FEMU_Group_Static:
         FrameGroup_static(&ssd->l_maptbl);
@@ -82,16 +82,9 @@ static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
         //         ssd->WB[i].PPA = 0;
         //     }
         // ssd->num_write_entries = 0;  
-              
-        femu_log("%s,LeaFTL_Write Static and clear Succesfully!\n", n->devname);
-        break;
-    case FEMU_DISABLE_LEAWRITE:
-        ssd->enable_leaftl_write = false;
-        femu_log("%s,LeaFTL_Write [disabled]!\n", n->devname);
-        break;
-    case FEMU_DISABLE_LEAREAD:
-        ssd->enable_leaftl_read = false;
-        femu_log("%s,LeaFTL_Read [disabled]!\n", n->devname);
+        break;   
+    case FEMU_DFTL_Static:
+        dftl_static(ssd->d_maptbl);
         break;
     default:
         printf("FEMU:%s,Not implemented flip cmd (%lu)\n", n->devname, cdw10);
