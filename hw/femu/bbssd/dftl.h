@@ -1,5 +1,6 @@
 #ifndef __DFTL_CACHE_H
 #define __DFTL_CACHE_H
+
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -8,12 +9,12 @@
 #include <string.h>
 
 #include "../nvme.h"
-
+#include "plr.h"
 
 /*slice L2P map in page size*/
 #define ENTRY_PER_PAGE  (1024) // 4KB / 4B = 1024
 #define CMT_ratio       1/256
-
+#define PLR_Error_bound 0
 
 typedef struct Node {
     uint64_t page_idx;
@@ -40,19 +41,7 @@ typedef struct LRUCache {
     uint8_t *flash_bmp;
 } LRUCache;
 
-typedef struct plr {
-    // TODO
-    int no_use;
-} plr;
 
-
-// DFTL_MAPPING_Table
-typedef struct G_map_entry {
-    uint64_t page_idx;
-    uint64_t ppa;
-    plr      segs; 
-
-} G_map_entry;
 
 typedef struct Cnt {
     int group_write_cnt;
@@ -65,6 +54,23 @@ typedef struct Cnt {
 }Cnt;
 
 
+
+
+
+// DFTL_MAPPING_Table
+typedef struct G_map_entry {
+    uint64_t page_idx;
+    uint64_t ppa;
+
+    PLR      plr;
+
+    Segment *segments;
+    uint32_t num_segments;
+    
+    Bitmap   bitmap_filter;
+
+} G_map_entry;
+
 typedef struct DFTLTable {
     LRUCache *CMT;    
 
@@ -75,7 +81,6 @@ typedef struct DFTLTable {
     struct Cnt counter;
     
 } DFTLTable;
-
 
 
 
@@ -114,5 +119,45 @@ DFTLTable* dftl_table_init(uint32_t tt_pages);
 
 void dftl_static(DFTLTable *d_maptbl);
 
+
+// PLR_method
+
+int dftl_Segment_is_valid(Segment *seg, uint32_t x);
+uint32_t dftl_Segment_gety(Segment *seg, bool check, uint32_t x);
+void dftl_Segment_check_properties(Segment *seg, Point *points, int num_points);
+void dftl_Segment_init(Segment *seg, double k, double b, int x1, int x2, Point *points, int num_points);
+void dftl_Segment_merge(Segment *new_seg, Segment *old_seg, int *samelevel);
+int dftl_get_y(SimpleSegment *simpleseg, int x);
+
+InsecPoint dftl_inter_section(SimpleSegment *s1, SimpleSegment *s2);
+bool dftl_is_above(Point *pt, SimpleSegment *s);
+bool dftl_is_below(Point *pt, SimpleSegment *s);
+Point dftl_get_upper_bound(Point *pt, double gamma);
+Point dftl_get_lower_bound(Point *pt, double gamma);
+SimpleSegment dftl_frompoints(Point p1, Point p2);
+SimpleSegment dftl_frompoints_insec(InsecPoint p1, Point p2);
+int32_t dftl_binary_search(G_map_entry *gtd, Segment *seg);
+
+void dftl_plr_init(PLR* plr, double gamma);
+void dftl_plr__init(PLR* plr);
+void dftl_plr_destroy(PLR* plr);
+void dftl_plr_add_segment(PLR *plr, Segment *seg);
+
+int dftl_build_segment(PLR* plr, Segment *seg);
+bool dftl_should_stop(PLR* plr, Point *point);
+int dftl_process_point(PLR* plr, Point* point, Segment *seg);
+void dftl_plr_learn(PLR* plr, Point* points, int num_points);
+
+void dftl_GTD_update(G_map_entry *gtd, Point* points, int num_points);
+
+void dftl_print_gtd(G_map_entry *gtd);
+
+
+void dftl_Segs_add_segment(Segs *segs, Segment *seg, int seg_id);
+
+void gtd_entry_init(G_map_entry *gtd, uint64_t page_idx);
+void gtd_add_segments(G_map_entry *gtd, Segment *segments, int num_segments);
+void gtd_add_segment(G_map_entry *gtd, Segment *seg, int *index);
+void gtd_del_segment(G_map_entry *gtd, int pos);
 
 #endif /* __DFTL_CACHE_H */

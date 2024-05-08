@@ -44,7 +44,9 @@ Node *createNode(uint64_t page_idx, struct ssd* ssd) {
     new_node->pre = NULL;
     
     new_node->l2p_entries = (uint64_t *)malloc(sizeof(uint64_t) * ENTRY_PER_PAGE);
-    memset(new_node->l2p_entries, 0xff, sizeof(uint64_t) * ENTRY_PER_PAGE); // 不能将每个元素设置成0xFFFFFFFF
+    for (int i = 0; i < ENTRY_PER_PAGE; i++) {
+        new_node->l2p_entries[i] = UNMAPPED_PPA;
+    }
     
     new_node->update_in_flash = true;
     new_node->hash_next = NULL;
@@ -275,8 +277,6 @@ uint64_t dftl_evict(DFTLTable *d_maptbl, LRUCache *cache, LRUCache* nand_cache,u
     if (cache->count >= cache->capacity) {
         Node *lastNode = cache->tail;
         if (lastNode) {
-            d_maptbl->counter.evit_cnt++;
-
             uint64_t has_index = hash(lastNode->page_idx, cache->capacity);
             Node *cur = cache->hashTable[has_index];
             Node *pre = NULL;
@@ -304,15 +304,32 @@ uint64_t dftl_evict(DFTLTable *d_maptbl, LRUCache *cache, LRUCache* nand_cache,u
                 uint64_t page_idx = lastNode->page_idx;      
                 
                 if (lastNode->update_in_flash) {
-                    (*lat) += NAND_PROG_LATENCY;           // don't use lat += ssd_advance_status(ssd, &ppa, &swr); 模拟机制 should be used?
+                    d_maptbl->counter.evit_cnt++;
                     
-                    // updae to GTD
-                    d_maptbl->GTD[page_idx].page_idx    = page_idx; 
-                    d_maptbl->GTD[page_idx].ppa         = lastNode->ppa;
-                    d_maptbl->GTD[page_idx].segs.no_use = 0; //todo
-    
-                    addNodeToNandCache(nand_cache, lastNode);  // movetoflahs should add lat
+                    // updae GTD, split point
+                    Point points[1024];
+                    int num_points = 0;
 
+                    for (uint64_t i = 0; i < ENTRY_PER_PAGE; i++) {
+                        uint64_t lpn, ppn;
+                        lpn = i; // lpn % ENTRY_PER_PAGE
+                        ppn = lastNode->l2p_entries[i];
+
+                        if (ppn != UNMAPPED_PPA) {
+                            Point pt;
+                            pt.x = lpn, pt.y = ppn;
+                            points[num_points++] = pt;
+                        }
+                    }
+
+                    d_maptbl->GTD[page_idx].page_idx = page_idx;
+                    d_maptbl->GTD[page_idx].ppa      = lastNode->ppa;
+
+                    dftl_GTD_update(&d_maptbl->GTD[page_idx], points, num_points);
+
+
+                    addNodeToNandCache(nand_cache, lastNode);  // movetoflahs should add lat
+                    (*lat) += NAND_PROG_LATENCY;           // don't use lat += ssd_advance_status(ssd, &ppa, &swr); 模拟机制 should be used?
 
                     // upate bitmap
                     uint64_t bmp_idx = lastNode->page_idx / 8;
@@ -393,16 +410,15 @@ uint64_t move_node_from_nand_to_cache(DFTLTable *d_maptbl, LRUCache *cache, LRUC
 DFTLTable* dftl_table_init(uint32_t tt_pages) {
     DFTLTable *table = (DFTLTable *)malloc(sizeof(DFTLTable));
     assert(table != NULL);
+
     uint64_t total_vpn = (tt_pages + ENTRY_PER_PAGE - 1) / ENTRY_PER_PAGE;
     uint64_t bmp_cnt = (total_vpn + 7) / 8;  // tt_pages / 1024 / 8
     
     table->CMT = createLRUCache(total_vpn * CMT_ratio, bmp_cnt);
 
     table->GTD = (G_map_entry *)malloc(sizeof(G_map_entry) * total_vpn);
-    for (int i = 0; i < total_vpn; i++) {
-        table->GTD[i].page_idx = i;
-        table->GTD[i].ppa      = UNMAPPED_PPA;
-        table->GTD[i].segs.no_use = 0;
+    for (uint64_t i = 0; i < total_vpn; i++) {
+        gtd_entry_init(&table->GTD[i], i);
     }
 
     table->nand_cache = createLRUCache(total_vpn, bmp_cnt);
@@ -414,6 +430,8 @@ DFTLTable* dftl_table_init(uint32_t tt_pages) {
     table->counter.group_double_read = 0;
     table->counter.evit_cnt          = 0;
 
+    
+
     return table;
 }
 
@@ -423,7 +441,7 @@ uint64_t dftl_get(DFTLTable *table, uint64_t lpa ,uint64_t* lat, struct ssd* ssd
     uint8_t  bit_idx = page_idx % 8;
 
 
-    if (!dftl_node_map_check_bit(&(table->CMT->flash_bmp[bmp_idx]), bit_idx)) {
+    if (!dftl_node_map_check_bit(&(table->CMT->flash_bmp[bmp_idx]), bit_idx)) { 
         uint64_t evit_page_idx = move_node_from_nand_to_cache(table, table->CMT, table->nand_cache, lpa, lat);
         if (evit_page_idx == UNMAPPED_PPA) {
             return evit_page_idx;
@@ -451,6 +469,572 @@ void dftl_put(DFTLTable* table, uint64_t lpa, uint64_t ppa , uint64_t* lat, stru
     return ;
 }
 
+
+
+// PLR_method
+int dftl_Segment_is_valid(Segment *seg, uint32_t x) {
+    if (!(x >= seg->x1 && x <= seg->x2))
+        return 0;
+    if (seg->accurate) {
+        int k = round(1.0/seg->k);
+        if (k != 0) {
+            if (((x - seg->x1) % k) != 0)
+                return 0;
+        } else {
+            // TODO
+        }
+    }
+    else {
+        if (seg->filter.length > 0 && (x - seg->x1) <= seg->filter.length) 
+            return seg->filter.bitmap[x - seg->x1];
+    }
+    return 1;
+}
+
+
+
+uint32_t dftl_Segment_gety(Segment *seg, bool check, uint32_t x) {
+    int predict = 0;
+    if (!check || dftl_Segment_is_valid(seg, x)) {
+            predict = (int)(x*seg->k + seg->b);
+            return predict;
+    }
+    return predict;
+}
+
+// 判断段属性: 精确性
+void dftl_Segment_check_properties(Segment *seg, Point *points, int num_points) {
+    seg->accurate = true, seg->consecutive = true;
+    
+    for (int i = 0; i < num_points; i++) {
+        uint32_t ppa;
+        ppa = dftl_Segment_gety(seg, false, points[i].x);
+        if (ppa != points[i].y) {
+            seg->accurate = false;
+        }
+        if (!seg->accurate) return ;
+    }
+}
+
+
+void dftl_Segment_init(Segment *seg, double k, double b, int x1, int x2, Point *points, int num_points) {
+    seg->k = k;
+    seg->b = b;
+    seg->x1 = x1;
+    seg->x2 = x2;
+    seg->accurate = true;
+      
+    seg->filter.length = 0;
+    seg->filter.bitmap = NULL;
+
+
+    if (points != NULL) {
+        dftl_Segment_check_properties(seg, points, num_points);
+
+        seg->filter.length = seg->x2 - seg->x1 + 1;
+        seg->filter.bitmap = (unsigned char *)malloc(seg->filter.length * sizeof(unsigned char));
+        memset(seg->filter.bitmap, 0, seg->filter.length * sizeof(unsigned char));
+
+        if (seg->filter.bitmap != NULL) {
+            memset(seg->filter.bitmap, 0, seg->filter.length * sizeof(unsigned char));
+            for (int i = 0; i < num_points; i++) {
+                seg->filter.bitmap[points[i].x - seg->x1] = 1;
+            } 
+        }
+    }
+}
+
+void dftl_Segment_merge(Segment *new_seg, Segment *old_seg, int *samelevel) {
+    if (0 && DeBUG) femu_log("new_seg.x1: %u, x2: %u, old_seg.x1: %u, old_seg.x2: %u\n", 
+                                    new_seg->x1, new_seg->x2, old_seg->x1, old_seg->x2);
+
+    int start = L_MIN(new_seg->x1, old_seg->x1);
+    int end   = L_MAX(new_seg->x2, old_seg->x2);
+
+    if (start == new_seg->x1 && end == new_seg->x2) {
+        *samelevel = -1;
+        return ;
+    }
+
+    if (new_seg->x1 > old_seg->x1 && new_seg->x1 <= old_seg->x2) {
+        old_seg->x2 = new_seg->x1 - 1;
+        *samelevel = 1;
+        
+        int k = 0;
+        int i = 0;
+        for (i = 0; i < old_seg->x2 - old_seg->x1 + 1; i++) {
+            old_seg->filter.bitmap[i] = old_seg->filter.bitmap[k++]; 
+        }
+        while (k < old_seg->filter.length) old_seg->filter.bitmap[k++] = 0;
+        return ;
+    }
+
+    if (old_seg->x1 > new_seg->x1 && old_seg->x1 <= new_seg->x2) {
+        *samelevel = 1;
+        
+        int k = new_seg->x2 - old_seg->x1 + 1;
+        int i = 0;
+        old_seg->x1 = new_seg->x2 + 1;
+        for (i = 0; i < old_seg->x2 - old_seg->x1 + 1; i++) {
+            if (k == old_seg->filter.length) break;
+            old_seg->filter.bitmap[i] = old_seg->filter.bitmap[k++];
+        }
+        while (i < old_seg->filter.length) old_seg->filter.bitmap[i++] = 0;
+        return ;
+    }
+    *samelevel = 0;   // 存在仍重叠 
+    return ;
+
+}
+
+
+
+/**
+ * @brief SimpleSegment_method
+ * 
+ */
+
+int dftl_get_y(SimpleSegment *simpleseg, int x) {
+    int predict;
+    predict = round(x * simpleseg->k + simpleseg->b);
+    return predict;
+}
+
+
+InsecPoint dftl_inter_section(SimpleSegment *s1, SimpleSegment *s2) {
+    InsecPoint insec_pt;
+    insec_pt.x = 0, insec_pt.y = 0;
+    // fix bug 如果两条直线平行或重叠是不会有交点的
+    if (s1->k != s2->k) {
+        insec_pt.x = (double) ((s2->b - s1->b) / (s1->k - s2->k));
+        insec_pt.y = (double) ((s1->k * s2->b - s2->k * s1->b) / (s1->k - s2->k));
+    }
+    return insec_pt;
+}
+
+bool dftl_is_above(Point *pt, SimpleSegment *s) {
+    return pt->y > (int)(s->k * pt->x + s->b);
+}
+
+bool dftl_is_below(Point *pt, SimpleSegment *s) {
+    return pt->y < (int)(s->k * pt->x + s->b);
+}
+
+Point dftl_get_upper_bound(Point *pt, double gamma) {
+    Point p;
+    p.x = pt->x, p.y = pt->y + gamma;
+    return p;
+}
+
+Point dftl_get_lower_bound(Point *pt, double gamma) {
+    Point p;
+    p.x = pt->x, p.y = pt->y - gamma;
+    return p;
+}
+
+SimpleSegment dftl_frompoints(Point p1, Point p2) {
+    SimpleSegment simplesegment;
+    if (p2.x != p1.x) {
+        simplesegment.k = (double)((double)(int32_t)(p2.y - p1.y) / (p2.x - p1.x));
+    }
+    if (p2.x != p1.x) {
+        simplesegment.b = (double)((double)(p1.y * p2.x) - (double)(p1.x * p2.y)) / (p2.x - p1.x);
+    }
+    simplesegment.x1 = p1.x;
+    simplesegment.x2 = p2.x;
+    return simplesegment;
+}
+
+SimpleSegment dftl_frompoints_insec(InsecPoint p1, Point p2) {
+    SimpleSegment simplesegment;
+    if (p2.x != p1.x) {
+        simplesegment.k = (double)((double)((int32_t)p2.y - p1.y) / (p2.x - p1.x));
+    }
+    if (p2.x != p1.x) {
+        simplesegment.b = (double)((double)(p1.y * p2.x) - (double)(p1.x * p2.y)) / (p2.x - p1.x);
+    }
+    simplesegment.x1 = p1.x;
+    simplesegment.x2 = p2.x;
+    return simplesegment;
+}
+
+
+/**
+ * @brief PLR_method
+ * 
+ */
+void dftl_plr_init(PLR* plr, double gamma) {
+    plr->gamma = gamma;
+    plr->max_length = ENTRY_PER_PAGE;
+
+    dftl_plr__init(plr);
+}
+
+
+// Tem_struct, use for build segments, and then destry after insert
+void dftl_plr__init(PLR* plr) {
+
+    // plr_destroy(plr);
+
+    plr->segments = g_malloc0(sizeof(Segment) * (plr->max_length));
+    for (int i = 0; i < plr->max_length; i++) {
+        dftl_Segment_init(&plr->segments[i], 0, 0, 0, 0, NULL, 0);
+    }
+    plr->num_segments = 0;
+
+    plr->s0.x = 0, plr->s0.y = 0;   // init point
+    plr->s1.x = 0, plr->s1.y = 0;
+    plr->rho_upper.k = 0, plr->rho_upper.b = 0, plr->rho_upper.x1 = 0, plr->rho_upper.x2 = 0;
+    plr->rho_lower.k = 0, plr->rho_lower.b = 0, plr->rho_lower.x1 = 0, plr->rho_lower.x2 = 0;
+    plr->sint.x = 0, plr->sint.y = 0;
+    plr->state = PLR_CONSTANTS_FIRST;
+    
+    plr->points = NULL;
+    plr->num_points = 0;
+
+}
+
+
+void dftl_plr_add_segment(PLR *plr, Segment *seg) {
+    plr->segments[plr->num_segments % plr->max_length] = *seg;
+    plr->num_segments++;  
+}
+
+void dftl_plr_destroy(PLR* plr) {
+    if (plr->segments != NULL) {
+        free(plr->segments);
+        plr->segments = NULL;
+        plr->num_segments = 0;
+    }
+    if (plr->points != NULL) {
+        free(plr->points);
+        plr->points = NULL;
+        plr->num_points = 0;        
+    }
+}
+
+int dftl_build_segment(PLR* plr, Segment *seg) {
+        if (plr->state == PLR_CONSTANTS_FIRST) { 
+            seg = NULL;
+            return 0;
+        }
+        // 建立单点段
+        else if (plr->state == PLR_CONSTANTS_SECOND) {
+            dftl_Segment_init(seg, 1, plr->s0.y - plr->s0.x, plr->s0.x, plr->s0.x, plr->points, plr->num_points);
+        }
+
+        // 建立多点段
+        else if (plr->state == PLR_CONSTANTS_READY) {
+            double avg_slope = ((plr->rho_lower.k + plr->rho_upper.k) / 2.0);
+            double intercept = 0;
+            if (plr->sint.x == 0 && plr->sint.y == 0) {
+                // intercept = -avg_slope * plr->s0.x + plr->s0.y;    // 不精确
+                avg_slope = plr->rho_lower.k;
+                intercept = plr->rho_lower.b;
+            } else {
+                intercept = -avg_slope * plr->sint.x + plr->sint.y;
+                
+            }
+            dftl_Segment_init(seg, avg_slope, intercept, plr->s0.x, plr->s1.x, plr->points, plr->num_points);
+        }
+        return 1;
+}
+
+bool dftl_should_stop(PLR* plr, Point *point) {
+    if (plr->s1.x == 0) {
+        if (point->x > plr->s0.x + plr->max_length || point->x <= plr->s0.x) return true;  // 段的横向长度
+    }else if (point->x > plr->s1.x + plr->max_length || point->x <= plr->s1.x) return true;
+
+    return false;
+}
+
+
+// up and lower 有界误差范围的线性回归学习
+int dftl_process_point(PLR* plr, Point* point, Segment *seg) {
+
+    int ret = 0;
+    if (plr->state == PLR_CONSTANTS_FIRST) {
+        plr->s0 = *point;
+        plr->state = PLR_CONSTANTS_SECOND;
+    } else if (plr->state == PLR_CONSTANTS_SECOND) {
+        if (dftl_should_stop(plr, point)) {
+            ret = dftl_build_segment(plr, seg);    //这里建
+
+            plr->s0 = *point;
+            plr->s1.x = 0, plr->s1.y = 0;
+            plr->rho_upper.k = 0, plr->rho_upper.b = 0, plr->rho_upper.x1 = 0, plr->rho_upper.x2 = 0;
+            plr->rho_lower.k = 0, plr->rho_lower.b = 0, plr->rho_lower.x1 = 0, plr->rho_lower.x2 = 0;
+            plr->sint.x = 0, plr->sint.y = 0;
+            plr->state = PLR_CONSTANTS_SECOND;
+
+            free(plr->points);
+            plr->points = NULL;
+            plr->num_points = 0;
+        }else{
+            plr->s1 = *point;
+            plr->rho_lower = dftl_frompoints(dftl_get_upper_bound(&plr->s0, plr->gamma), 
+                                                    dftl_get_lower_bound(&plr->s1, plr->gamma));
+            plr->rho_upper = dftl_frompoints(dftl_get_lower_bound(&plr->s0, plr->gamma), 
+                                                    dftl_get_upper_bound(&plr->s1, plr->gamma));            
+            plr->sint = dftl_inter_section(&plr->rho_upper, &plr->rho_lower);
+
+            plr->state = PLR_CONSTANTS_READY;
+        }
+    } else if (plr->state == PLR_CONSTANTS_READY) {
+        // 如果这个点既不在下界上面也不在上界下面而且x坐标距离已经超出了s0开始的值() 则建段
+        if (dftl_is_below(point, &plr->rho_lower) || dftl_is_above(point, &plr->rho_upper) || dftl_should_stop(plr, point)) {
+            ret = dftl_build_segment(plr, seg);     
+
+            plr->s0 = *point;
+            plr->s1.x = 0, plr->s1.y = 0;
+            plr->rho_upper.k = 0, plr->rho_upper.b = 0, plr->rho_upper.x1 = 0, plr->rho_upper.x2 = 0;
+            plr->rho_lower.k = 0, plr->rho_lower.b = 0, plr->rho_lower.x1 = 0, plr->rho_lower.x2 = 0;
+            plr->sint.x = 0, plr->sint.y = 0;
+            plr->state = PLR_CONSTANTS_SECOND;
+
+            free(plr->points);
+            plr->points = NULL;
+            plr->num_points = 0;
+        }else {
+            plr->s1 = *point;
+
+            Point s_upper = dftl_get_upper_bound(point, plr->gamma);
+            Point s_lower = dftl_get_lower_bound(point, plr->gamma);
+
+            if (dftl_is_below(&s_upper, &plr->rho_upper)) 
+                plr->rho_upper = dftl_frompoints_insec(plr->sint, s_upper);
+            if (dftl_is_above(&s_lower, &plr->rho_lower)) 
+                plr->rho_lower = dftl_frompoints_insec(plr->sint, s_lower);
+        }
+    }
+
+    if (plr->num_points == 0) {
+            plr->points = (Point *)malloc(sizeof(Point));
+    } else {
+        plr->points = (Point *)realloc(plr->points, (plr->num_points + 1) * sizeof(Point));
+    }
+    plr->points[plr->num_points] = *point;
+    plr->num_points++;
+
+    return ret;
+}
+
+void dftl_plr_learn(PLR* plr, Point* points, int num_points) {
+    // femu_log("[plr_learn]: in\n");
+
+    for (int i = 0; i < num_points; i++) {
+        Segment seg;
+        dftl_Segment_init(&seg, 0, 0, 0, 0, NULL, 0);
+        int ret = dftl_process_point(plr, &points[i], &seg);
+        if (ret) {
+            dftl_plr_add_segment(plr, &seg);
+        }
+    }
+
+    Segment final_seg;
+    dftl_Segment_init(&final_seg, 0, 0, 0, 0, NULL, 0);
+    int ret = dftl_build_segment(plr, &final_seg);
+   //femu_log("[process_pt]: 段学习完成, 总共点数:%d\n", plr->num_points);
+    if (ret) {
+           // femu_log("[plr_learn]: 学习成功后添加段(最后的段)\n");
+            plr_add_segment(plr, &final_seg);
+    }
+
+    return ;
+}
+
+void dftl_GTD_update(G_map_entry *gtd, Point* points, int num_points) {
+    
+    dftl_plr__init(&gtd->plr);
+    dftl_plr_learn(&gtd->plr, points, num_points);
+    
+    
+    if (0 && DeBUG) {
+        for (int i = 0; i < gtd->plr.num_segments; i++) {
+            Segment seg = gtd->plr.segments[i];
+            femu_log("[gtd_update][plr_Segment %d]: k: %.2f, b: %.2f, x1: %u, x2: %u, %s, %s\n", i,
+                seg.k, seg.b, seg.x1, seg.x2, seg.accurate ? "精确":"不精确", seg.consecutive ? "连续":"不连续");
+        }
+    }
+
+    gtd_add_segments(gtd, gtd->segments, gtd->num_segments); 
+    
+    if (0 && DeBUG) {
+        femu_log("[gtd_update]: 此次segs索引段添加到gtd完成, 此时的gtd[%lu]信息如下:\n", gtd->page_idx);
+        dftl_print_gtd(gtd);
+    }
+
+    dftl_plr_destroy(&gtd->plr);    
+}
+
+int32_t dftl_binary_search(G_map_entry *gtd, Segment *seg) {
+    int32_t left = 0;
+    int32_t right = gtd->num_segments - 1;
+    int32_t mid = 0;
+    int32_t target = seg->x1;
+    while (left < right) {
+        mid = (left + right) >> 1;
+        //femu_log("[begin] left:%u, right:%u, mid:%u\n",left, right, mid);
+        if (gtd->segments[mid].x1 >= target) {
+            right = mid;
+        } else {
+            left = mid + 1;
+        }
+       // fprintf("[end] left:%u, right:%u, mid:%u\n",left, right, mid);
+    }
+    return left;
+}
+
+
+void gtd_add_segment(G_map_entry *gtd, Segment *seg, int *index) {
+    if (gtd->num_segments == 0) {
+        gtd->segments = (Segment *)malloc(1 * sizeof(Segment));
+        gtd->segments[0] = *seg;  // C语言结构浅拷贝,有可能出bug 
+        gtd->num_segments++; 
+        *index = 0;
+    } else {
+        gtd->segments = (Segment *)realloc(gtd->segments, (gtd->num_segments + 1) * sizeof(Segment));
+        // 二分查找插入位置,永远是右半区的最左边界
+        int32_t pos = dftl_binary_search(gtd, seg);
+        if (pos == gtd->num_segments - 1 && seg->x1 > gtd->segments[pos].x1) {
+            pos = gtd->num_segments;
+            *index = pos;
+            gtd->num_segments++;
+            gtd->segments[pos] = *seg;
+        } else {
+            *index = pos;
+            gtd->num_segments++;
+            for (int i = gtd->num_segments - 1; i >= pos + 1; i--) {
+                gtd->segments[i] = gtd->segments[i - 1];
+            }
+            gtd->segments[pos] = *seg;          
+        }
+    }
+    
+    // update Bitmap
+    uint32_t k = 0;
+    uint32_t i = seg->x1;
+    while (i <= seg->x2 && k < seg->filter.length) {
+        gtd->bitmap_filter.bitmap[i++] = seg->filter.bitmap[k++];
+    }  
+}
+
+void dftl_Segs_add_segment(Segs *segs, Segment *seg, int seg_id) {
+    if (segs->num_segments == 0) {
+        segs->segments = (Segment *)malloc(1 * sizeof(Segment));
+        segs->segments[0] = *seg;  
+        segs->segment_id[0] = seg_id; 
+        segs->num_segments++; 
+    } else {
+        segs->segments = (Segment *)realloc(segs->segments, (segs->num_segments + 1) * sizeof(Segment));
+        segs->segments[segs->num_segments] = *seg;
+        segs->segment_id[segs->num_segments] = seg_id;
+        segs->num_segments++;
+    }
+}
+
+void gtd_del_segment(G_map_entry *gtd, int pos) {
+    if (pos < 0 || pos >= gtd->num_segments) {
+        femu_log("删除位置不对\n");
+        return ;
+    }
+    for (int i = pos; i < gtd->num_segments - 1; i++) {
+        gtd->segments[i] = gtd->segments[i + 1];
+    }
+    gtd->num_segments--;
+    gtd->segments = (Segment *)realloc(gtd->segments, gtd->num_segments * sizeof(Segment));
+
+    if (gtd->num_segments == 0) {
+        free(gtd->segments);
+        gtd->segments = NULL;
+    }
+}
+
+void gtd_add_segments(G_map_entry *gtd, Segment *segments, int num_segments) {
+
+    for (int i = 0; i < num_segments; i++) {
+        int index = 0;
+
+        if (gtd->num_segments == 0) {
+            gtd_add_segment(gtd, &segments[i], &index);
+            continue;
+        }
+        Segs overlap_segs;
+        overlap_segs.num_segments = 0;
+        overlap_segs.segments = NULL;
+        memset(overlap_segs.segment_id, 0, Write_Buffer_Entries * sizeof(int));
+
+        gtd_add_segment(gtd, &segments[i], &index);
+        if (index != 0) {
+            if (gtd->segments[index].x1 <= gtd->segments[index - 1].x2) {
+                dftl_Segs_add_segment(&overlap_segs, &gtd->segments[index - 1], index - 1);
+            }
+        }
+        for (int j = index + 1; j < gtd->num_segments; j++) {
+            if (gtd->segments[j].x1 > segments[i].x2) {
+                break;
+            }
+            dftl_Segs_add_segment(&overlap_segs, &gtd->segments[j], j);            
+        }
+        
+
+        uint32_t indices_to_delete[1024];
+        int      indect_pointer = 0;
+
+        for (int j = 0; j < overlap_segs.num_segments; j++) {
+            int same_level = 0;
+            dftl_Segment_merge(&segments[i], &overlap_segs.segments[j], &same_level);
+
+            if (same_level == -1) {
+                indices_to_delete[indect_pointer++] = overlap_segs.segment_id[j]; 
+            } else if (same_level == 0) {
+                //TODO               
+            } else if (same_level == 1) {
+                // 合并后不重叠
+                int pos = overlap_segs.segment_id[j];
+                gtd->segments[pos] = overlap_segs.segments[j];
+            }
+
+        }
+    
+        if (overlap_segs.segments != NULL) {
+            free(overlap_segs.segments);
+            overlap_segs.num_segments = 0;
+            overlap_segs.segments = NULL;
+        }
+
+        for (int j = indect_pointer - 1; j >= 0; j--) {
+            gtd_del_segment(gtd, indices_to_delete[j]);
+        }
+
+    }
+    return ;
+}
+
+void gtd_entry_init(G_map_entry *gtd, uint64_t page_idx) {
+    gtd->page_idx = page_idx;
+    gtd->ppa      = UNMAPPED_PPA;
+    
+    // 精确段 误差0
+    dftl_plr_init(&gtd->plr, PLR_Error_bound);
+
+    gtd->bitmap_filter.length = ENTRY_PER_PAGE + 1;
+    gtd->bitmap_filter.bitmap = (unsigned char *)malloc(gtd->bitmap_filter.length * sizeof(unsigned char));
+    memset(gtd->bitmap_filter.bitmap, 0, gtd->bitmap_filter.length * sizeof(unsigned char));
+
+    gtd->num_segments = 0;
+    gtd->segments = NULL;
+}
+
+
+void dftl_print_gtd(G_map_entry *gtd) {
+    for (int i = 0; i < gtd->num_segments; i++) {
+        Segment seg = gtd->segments[i];
+        femu_log("[gtd_Segment %d]: k: %.2f, b: %.2f, x1: %u, x2: %u, %s, %s\n", i,
+                seg.k, seg.b, seg.x1, seg.x2, seg.accurate ? "精确":"不精确", seg.consecutive ? "连续":"不连续");
+    }
+}
+
 void dftl_static(DFTLTable *d_maptbl) {
     femu_log("[DFTL]write_cnt:%d, read_cnt: %d, read_miss: %d, cmt_hit: %d, double_read: %d, evit_cnt: %d\n",
     d_maptbl->counter.group_write_cnt, d_maptbl->counter.group_read_cnt,
@@ -458,4 +1042,9 @@ void dftl_static(DFTLTable *d_maptbl) {
     d_maptbl->counter.group_double_read, d_maptbl->counter.evit_cnt);
     femu_log("[DFTL]cache_cnt: %lu/%lu, nand_cnt: %lu/%lu\n", d_maptbl->CMT->count, d_maptbl->CMT->capacity, 
     d_maptbl->nand_cache->count, d_maptbl->nand_cache->capacity);
+}
+
+
+void o_static(struct ssd* ssd) {
+    return ;
 }

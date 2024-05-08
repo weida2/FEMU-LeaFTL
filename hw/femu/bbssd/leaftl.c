@@ -38,7 +38,7 @@ void crb_insert_segment(CRB *crb, Segment* seg) {
         for (unsigned char j = 0; j < crb->num_segments - i - 1; j++) {
             if (crb->segments[j].x1 > crb->segments[j + 1].x1) {
                 // Swap the segments
-                ApproximateSegment temp = crb->segments[j];
+                Segment temp = crb->segments[j];
                 crb->segments[j] = crb->segments[j + 1];
                 crb->segments[j + 1] = temp;
             }
@@ -211,10 +211,10 @@ bool Segment_overlaps(Segment *seg1, Segment *seg2) {
 
 // may has a bug // fix
 void Segment_merge(Segment *new_seg, Segment *old_seg, int *samelevel) {
-    if (!old_seg || !old_seg->k || !old_seg->x1 || !old_seg->filter.bitmap) {
-        *samelevel = 2;
-        return;
-    }
+    // if (!old_seg || !old_seg->k || !old_seg->x1 || !old_seg->filter.bitmap) {
+    //     *samelevel = 2;
+    //     return;
+    // }
 
     //else if (new_seg->consecutive)  no use new_seg->consecutive
     if (0 && DeBUG) femu_log("new_seg.x1: %u, x2: %u, old_seg.x1: %u, old_seg.x2: %u\n", 
@@ -329,9 +329,6 @@ void SimpleSegment_init(SimpleSegment *simpseg, double k, double b, int x1, int 
     simpseg->x2 = x2;    
 }
 
-// int round(double x) {
-//     return (int)(x + 0.5);
-// }
 
 int get_y(SimpleSegment *simpleseg, int x) {
     int predict;
@@ -339,12 +336,6 @@ int get_y(SimpleSegment *simpleseg, int x) {
     return predict;
 }
 
-Point intersection(SimpleSegment *s1, SimpleSegment *s2) {
-    Point p;
-    p.x = (int) ((s2->b - s1->b) / (s1->k - s2->k));
-    p.y = (int) ((s1->k * s2->b - s2->k * s1->b) / (s1->k - s2->k));
-    return p;
-}
 
 InsecPoint inter_section(SimpleSegment *s1, SimpleSegment *s2) {
     InsecPoint insec_pt;
@@ -811,10 +802,10 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
             femu_log("[Group_add_segments]:g[%d]->L[%d].num_segs: %d, error 超出最大值! \n", group->group_id, level, group->L[level].num_segments);
 
             if (group->L[level].num_segments >= 1024) {
+                Print_Group(group);
                 break;
             }
             //break;
-            
         }
 
         if (group->L[level].num_segments == 0) {
@@ -924,14 +915,13 @@ void Group_add_segments(Group *group, int level, Segment *segments, int num_segm
 
 void Group_update(Group *group, Point* points, int num_points) {
     // Points 应该是已经排序好的 lpa : ppa
-    //double gamma = 0;
-
-    // femu_log("[Group_update]: in\n");
+    u_int64_t stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     plr__init(&group->plr);
     plr_learn(&group->plr, points, num_points);
     plr_sorted(&group->plr);
+    u_int64_t etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     
-   // femu_log("[Group_update]: plr学习完成, num_segments:%d\n", group->plr.num_segments);
+    femu_log("[Group_update]: plr学习完成, num_segments:%d, learn_time: %lu ns\n", group->plr.num_segments, etime - stime);
     
     // print
     if (0 && DeBUG) {
@@ -946,18 +936,20 @@ void Group_update(Group *group, Point* points, int num_points) {
     
     if (0 && DeBUG) {
         femu_log("[Group_update]: 此次segs索引段添加到group完成, 此时的group[%d]信息如下:\n", group->group_id);
-        for (int i = 0; i < group->num_levels; i++) {
-            for (int j = 0; j < group->L[i].num_segments; j++) {
-                Segment seg = group->L[i].segments[j];
-                femu_log("[Group_update] group[%d]->L[%d][Segment %d]: k: %.2f, b: %.2f, x1: %u, x2: %u, %s, %s\n", group->group_id, 
-                i, j, seg.k, seg.b, seg.x1, seg.x2, seg.accurate ? "精确":"不精确", seg.consecutive ? "连续":"不连续");            
-            }
-        }
+        Print_Group(group);
     }
     plr_destroy(&group->plr);
-    // femu_log("[Group_update]: out\n");
 }
 
+void Print_Group(Group *group) {
+    for (int i = 0; i < group->num_levels; i++) {
+        for (int j = 0; j < group->L[i].num_segments; j++) {
+            Segment seg = group->L[i].segments[j];
+            femu_log("[Group_update] group[%d]->L[%d][Segment %d]: k: %.2f, b: %.2f, x1: %u, x2: %u, %s, %s\n", group->group_id, 
+            i, j, seg.k, seg.b, seg.x1, seg.x2, seg.accurate ? "精确":"不精确", seg.consecutive ? "连续":"不连续");            
+        }
+    }    
+}
 
 void FrameGroup_init(FrameGroup *framegroup, double gamma) {
     framegroup->gamma = gamma;

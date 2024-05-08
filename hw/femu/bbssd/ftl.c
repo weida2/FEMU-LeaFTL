@@ -310,8 +310,8 @@ static void ssd_init_params(struct ssdparams *spp)
 {
     spp->secsz = 512;
     spp->secs_per_pg = 8;
-    spp->pgs_per_blk = 1024; // *2 * 2 = 64GB
-    spp->blks_per_pl = 256; /* 16GB */
+    spp->pgs_per_blk = 1024; // *2 * 2 = 128 GB
+    spp->blks_per_pl = 512; /* 32GB */
     spp->pls_per_lun = 1;
     spp->luns_per_ch = 8;
     spp->nchs = 8;
@@ -492,8 +492,12 @@ void ssd_init(FemuCtrl *n)
 
     // 初始化 DFTLTable
     ssd->d_maptbl = dftl_table_init(ssd->sp.tt_pgs);
-
     ssd->io_interface = NORMAL_IO;
+
+    ssd->write_cnt = 0;
+    ssd->map_cnt   = 0;
+    ssd->read_cnt  = 0;
+    ssd->read_miss = 0;
 
     /* initialize rmap */
     ssd_init_rmap(ssd);
@@ -1025,7 +1029,6 @@ static uint64_t ssd_lea_read(struct ssd *ssd, NvmeRequest *req)
         uint64_t stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         ret_ppa = FrameGroup_lookup(&ssd->l_maptbl, lpn, &seg);
         uint64_t etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-      //  femu_log("[lookup_cost]LA:%lu -> PA:%lu, et-st:%lu ns\n", lpn, ret_ppa, etime - stime);
         ssd->l_maptbl.counter.group_read_cnt++;
 
         if (!ret_ppa) {
@@ -1040,6 +1043,7 @@ static uint64_t ssd_lea_read(struct ssd *ssd, NvmeRequest *req)
             continue;
         }
         else {
+            //  femu_log("[lookup_cost]LA:%lu -> PA:%lu, et-st:%lu ns\n", lpn, ret_ppa, etime - stime);
             if (!seg.accurate) {
                 //femu_log("seg不精确,寻找ppa: %lu 对应的oob\n", ret_ppa);
                 uint64_t ed = (uint64_t)ssd->l_maptbl.gamma;
@@ -1142,6 +1146,7 @@ static uint64_t ssd_lea_write(struct ssd *ssd, NvmeRequest *req)
             uint64_t stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 
             int n = ssd->num_write_entries;
+            // sort lpn
             for (int i = 0; i < n - 1; i++) {
                 for (int j = 0; j < n - i - 1; j++) {
                     if (ssd->WB[j].LPA > ssd->WB[j + 1].LPA) {
@@ -1152,9 +1157,19 @@ static uint64_t ssd_lea_write(struct ssd *ssd, NvmeRequest *req)
                     }
                 }
             }
-            
-            struct ppa PPA;
+            // remove duplicate data
+            int cur_idx = 0, uni_idx = 0;
+            while (cur_idx < n) {
+                ssd->WB[uni_idx] = ssd->WB[cur_idx];
+                while (cur_idx < n - 1 && ssd->WB[cur_idx].LPA == ssd->WB[cur_idx + 1].LPA) {
+                    cur_idx++;
+                }
+                uni_idx++;
+                cur_idx++; 
+            }
+            n = uni_idx;
 
+            struct ppa PPA;
             struct ppa TPPA[1030];
             for (int i = 0; i < n; i++) {
                 PPA = get_new_page(ssd);
@@ -1181,7 +1196,7 @@ static uint64_t ssd_lea_write(struct ssd *ssd, NvmeRequest *req)
             FrameGroup_update(&ssd->l_maptbl, points, n);
 
             uint64_t etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-           // femu_log("[training_cost]stime:%lu, etime:%lu, et-st:%lu ns\n", stime, etime, etime - stime);
+            femu_log("[training_cost]stime:%lu, etime:%lu, et-st:%lu ns\n", stime, etime, etime - stime);
            // FrameGroup_static(&ssd->l_maptbl);
             for (int i = 0; i < WB_Entries + 2; i++) {
                 ssd->WB[i].LPA = 0;
@@ -1219,9 +1234,19 @@ static uint64_t ssd_lea_write(struct ssd *ssd, NvmeRequest *req)
                     }
                 }
             }
-            
-            struct ppa PPA;
+            // remove duplicate data
+            int cur_idx = 0, uni_idx = 0;
+            while (cur_idx < n) {
+                ssd->WB[uni_idx] = ssd->WB[cur_idx];
+                while (cur_idx < n - 1 && ssd->WB[cur_idx].LPA == ssd->WB[cur_idx + 1].LPA) {
+                    cur_idx++;
+                }
+                uni_idx++;
+                cur_idx++; 
+            }
+            n = uni_idx;
 
+            struct ppa PPA;
             struct ppa TPPA[1030];
             for (int i = 0; i < n; i++) {
                 PPA = get_new_page(ssd);
@@ -1243,9 +1268,8 @@ static uint64_t ssd_lea_write(struct ssd *ssd, NvmeRequest *req)
                     femu_log("lpa:%u -> ppa:%u\n", points[i].x, points[i].y);
                 }
             }
-            femu_log("ssd_lea_write, 准备开始更新\n");
+            
             FrameGroup_update(&ssd->l_maptbl, points, n);
-            femu_log("ssd_lea_write, 索引更新结束\n");
 
             uint64_t etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
             femu_log("[training_cost]stime:%lu, etime:%lu, et-st:%lu ns\n", stime, etime, etime - stime);

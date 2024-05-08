@@ -10,6 +10,7 @@
         "string_view": "c",
         "dftl.h": "c",
         "*.idef": "c",
-        "*.def": "c"
+        "*.def": "c",
+        "plr.h": "c"
     }
 }

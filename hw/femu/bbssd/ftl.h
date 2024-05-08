@@ -6,7 +6,7 @@
 #include "leaftl.h"
 #include "dftl.h"
 
-#define  error_bound 1   // 误差范围
+#define  error_bound 0   // 误差范围
 // #include "test.hpp"
 
 #define INVALID_PPA     (~(0ULL))
@@ -231,6 +231,12 @@ struct ssd {
     struct write_pointer wp;
     struct line_mgmt lm;
 
+    int write_cnt;
+    int map_cnt;
+    int read_cnt;
+    int read_miss; 
+
+
     // leaftl.struct
     struct Write_Buffer WB[WB_Entries + 2];
     int    num_write_entries;
@@ -261,6 +267,7 @@ void ssd_advance_write_pointer(struct ssd *ssd);
 // dftl.func 
 uint64_t dftl_get(DFTLTable *table, uint64_t lpa ,uint64_t* lat, struct ssd* ssd);
 void dftl_put(DFTLTable* table, uint64_t lpa, uint64_t ppa , uint64_t* lat, struct ssd* ssd);
+void o_static(struct ssd* ssd);
 
 uint64_t lru_get(DFTLTable *d_maptbl, LRUCache *cache, uint64_t key, struct ssd* ssd);
 void lru_put(DFTLTable *d_maptbl, LRUCache *cache,LRUCache *nand_cache,uint64_t key, uint64_t value ,uint64_t*lat, struct ssd* ssd);
