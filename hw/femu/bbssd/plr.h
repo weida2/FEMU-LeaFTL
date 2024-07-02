@@ -94,7 +94,7 @@ typedef struct PLR{
     int max_length;  // 256
 
     Segment *segments;
-    uint8_t num_segments;
+    uint32_t num_segments;
 
     Point s0;
     Point s1;

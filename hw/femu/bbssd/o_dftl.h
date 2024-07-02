@@ -1,21 +1,13 @@
-#include "../nvme.h"
+#ifndef __FEMU_DFTL_H
+#define __FEMU_DFTL_H
 
-// #include "test.hpp"
+#include "../nvme.h"
 
 #define INVALID_PPA     (~(0ULL))
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
 
-#define ENTRY_PER_PAGE  (1024) // 4KB / 4B = 1024
-#define CMT_ratio       1/8     // 4MB
-
-#define BLK_BITS    (16)
-#define PG_BITS     (16)
-#define SEC_BITS    (8)
-#define PL_BITS     (8)
-#define LUN_BITS    (8)
-#define CH_BITS     (7)
-// 1k * 4KB = 4MB 假设SSD内写入缓冲区的大小为 4MB 可以缓存1k条lpa：ppa条目
+#define CMT_HASH_SIZE (24593ULL)
 
 enum {
     NAND_READ =  0,
@@ -64,12 +56,22 @@ enum {
 };
 
 enum {
-    NONE  = 0,
-    DATA  = 1,
-    TRANS = 2,
+    CLEAN = 0,
+    DIRTY = 1
 };
 
+enum {
+    NONE = 0,
+    DATA = 1,
+    TRANS = 2
+};
 
+#define BLK_BITS    (16)
+#define PG_BITS     (16)
+#define SEC_BITS    (8)
+#define PL_BITS     (8)
+#define LUN_BITS    (8)
+#define CH_BITS     (7)
 
 /* describe a physical page addr */
 struct ppa {
@@ -169,13 +171,14 @@ struct ssdparams {
     int blks_per_line;
     int tt_lines;
 
-    int pls_per_line;
-    int luns_per_line;
-
     int pls_per_ch;   /* # of planes per channel */
     int tt_pls;       /* total # of planes in the SSD */
 
     int tt_luns;      /* total # of LUNs in the SSD */
+
+    int ents_per_pg;
+    int tt_cmt_size;
+    int tt_gtd_size;
 };
 
 typedef struct line {
@@ -185,8 +188,7 @@ typedef struct line {
     QTAILQ_ENTRY(line) entry; /* in either {free,victim,full} list */
     /* position in the priority queue for victim lines */
     size_t                  pos;
-
-    int type;   // DATA:1, TRANS:2
+    int type;
 } line;
 
 /* wp: record next write addr */
@@ -199,15 +201,23 @@ struct write_pointer {
     int pl;
 };
 
+/* wp: record next translation page write addr */
+struct trans_write_pointer {
+    struct line *curline;
+    int ch;
+    int lun;
+    int pg;
+    int blk;
+    int pl;
+};
+
 struct line_mgmt {
     struct line *lines;
     /* free line list, we only need to maintain a list of blk numbers */
     QTAILQ_HEAD(free_line_list, line) free_line_list;
+    pqueue_t *victim_line_pq;
     //QTAILQ_HEAD(victim_line_list, line) victim_line_list;
     QTAILQ_HEAD(full_line_list, line) full_line_list;
-    
-    pqueue_t *victim_line_pq; // for GC
-
     int tt_lines;
     int free_line_cnt;
     int victim_line_cnt;
@@ -220,75 +230,35 @@ struct nand_cmd {
     int64_t stime; /* Coperd: request arrival time */
 };
 
-typedef struct Node {
-    uint64_t page_idx;
-    uint64_t *l2p_entries;   // pair<int, int>[0~1024] l2p
+typedef struct cmt_entry {
+    uint64_t lpn;
     uint64_t ppn;
+    int dirty;
+    QTAILQ_ENTRY(cmt_entry) entry;
+    struct cmt_entry *next;    /* for hash */
+} cmt_entry;
 
-    bool update_in_flash;    // cache 和 nand_flash 的一致性判断
+typedef struct hash_table {
+    cmt_entry *cmt_table[CMT_HASH_SIZE];
+}hash_table;
 
-    struct Node *pre;
-    struct Node *next;
-    
-    struct Node *hash_next;  // ??链式哈希值, 用于链式哈希的同一个%hash=key的下一个指针结点
-} Node;
+struct cmt_mgmt {
+    cmt_entry *cmt_entries;
+    QTAILQ_HEAD(free_cmt_entry_list, cmt_entry) free_cmt_entry_list;
+    //QTAIQ_HEAD 为热度最高的
+    QTAILQ_HEAD(cmt_entry_list, cmt_entry) cmt_entry_list;
+    int tt_entries;
+    int free_cmt_entry_cnt;
+    int used_cmt_entry_cnt;
+    struct hash_table ht;
+};
 
-
-typedef struct LRUCache {
-    uint64_t capacity;
-    uint64_t count;
-    
-    Node *head;
-    Node *tail;
-
-    Node **hashTable; // ??链式哈希？
-
-    uint8_t *flash_bmp;
-} LRUCache;
-
-
-typedef struct Cnt {
-
-
-    int group_write_cnt;
-    uint64_t *has_tbl;
-    uint64_t write_maxLBA; 
-    uint64_t write_minLBA;
-
-
-    int group_read_cnt;
-    int group_read_miss; 
-
-    int group_cmt_hit;
-    int group_cmt_miss;
-
-    int evit_cnt;
-    int gc_data_cnt;
-    int gc_trans_cnt;
-
-}Cnt;
-
-
-
-
-
-// DFTL_MAPPING_Table
-typedef struct G_map_entry {
-    uint64_t ppn;
-
-} G_map_entry;
-
-typedef struct DFTLTable {
-    LRUCache *CMT;    
-    LRUCache *nand_cache; 
-
-    G_map_entry *GTD;
-    
-    struct Cnt counter;    
-} DFTLTable;
-
-
-
+struct statistics {
+    uint64_t cmt_hit_cnt;
+    uint64_t cmt_miss_cnt;
+    double cmt_hit_ratio;
+    uint64_t access_cnt;
+};
 
 struct ssd {
     char *ssdname;
@@ -296,27 +266,23 @@ struct ssd {
     struct ssd_channel *ch;
     struct ppa *maptbl; /* page level mapping table */
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
-
-    struct write_pointer d_wp;   // datablock wp    
+    struct write_pointer wp;
     struct line_mgmt lm;
 
-
-    // dftl.struct
-    DFTLTable* d_maptbl;
-    struct write_pointer  t_wp;  // translation block wp;
-    struct line_mgmt      t_lm; 
-
-    int pass;
+    struct cmt_mgmt cm;
+    struct ppa *gtd;
+    struct trans_write_pointer twp;
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;
     struct rte_ring **to_poller;
     bool *dataplane_started_ptr;
     QemuThread ftl_thread;
+
+    struct statistics stat;
 };
 
 void ssd_init(FemuCtrl *n);
-
 
 #ifdef FEMU_DEBUG_FTL
 #define ftl_debug(fmt, ...) \
@@ -340,3 +306,4 @@ void ssd_init(FemuCtrl *n);
 #define ftl_assert(expression)
 #endif
 
+#endif

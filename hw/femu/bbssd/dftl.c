@@ -1,6 +1,13 @@
 #include "dftl.h"
-#include "./ftl.h"
+static void *ftl_thread(void *arg);
+static uint64_t translation_page_write(struct ssd *ssd, uint64_t vpn);
+static uint64_t translation_page_read(struct ssd *ssd, uint64_t vpn, NvmeRequest *req, struct nand_lun *trans_lun);
 
+uint64_t dftl_evict(DFTLTable *d_maptbl, LRUCache *cache, LRUCache* nand_cache, uint64_t *lat, struct ssd* ssd);
+uint64_t addNodeToNandCache(LRUCache *nand_cache, Node *node);
+static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct
+        nand_cmd *ncmd);
+static inline struct ppa pgidx2ppa(struct ssd *ssd, uint64_t pgidx);
 
 
 /**
@@ -8,36 +15,40 @@
  * 
  * 创建CMT_table_Node
  */
+
+
 uint64_t hash(uint64_t key, uint64_t capacity)
 {
     return key % capacity;
 }
-void dftl_node_map_set_bit(uint8_t *map, uint8_t bit_idx) {
+void map_set_bit(uint8_t *map, uint8_t bit_idx) {
     *map |= (1 << bit_idx);
 }
 
-uint8_t dftl_node_map_check_bit(uint8_t *map, uint8_t bit_idx) {
+uint8_t map_check_bit(uint8_t *map, uint8_t bit_idx) {
     return *map & (1 << bit_idx);
 }
 
-void dftl_node_map_clear_bit(uint8_t *map, uint8_t bit_idx) {
+void map_clear_bit(uint8_t *map, uint8_t bit_idx) {
     *map &= ~(1 << bit_idx);    
 }
 
 
-Node *createNode(uint64_t page_idx, struct ssd* ssd) {
+Node *createNode(struct ssd* ssd, uint64_t page_idx) {
     Node *new_node = (Node *)malloc(sizeof(Node));
-    
-    struct ppa ppa;
-    ppa = get_new_page(ssd);
-    uint64_t vpgidx = ppa2vpgidx(ssd, &ppa);
-    ssd_advance_write_pointer(ssd);
+
+    // 当下刷时再获取在闪存块中的ppn
+    // struct ppa ppa;
+    // ppa = get_new_page(ssd, TRANS);
+    // ssd_advance_write_pointer(ssd, TRANS);
+    // uint64_t ppn = ppa2vpgidx(ssd, &ppa);
+    // new_node->ppn = ppn;        // ppn
 
     //ssd->rmap[vpgidx] = page_idx; // rmap.g == page.type ? 0: translate page, 1: data page 
                                     // rmap.vpn, rmap.lpn
 
 
-    new_node->ppa = vpgidx;        // ppn
+ 
     new_node->page_idx = page_idx; // vpn
 
     new_node->next = NULL;
@@ -48,7 +59,7 @@ Node *createNode(uint64_t page_idx, struct ssd* ssd) {
         new_node->l2p_entries[i] = UNMAPPED_PPA;
     }
     
-    new_node->update_in_flash = true;
+    new_node->update_in_flash = true; // dirty
     new_node->hash_next = NULL;
     
     return new_node;
@@ -139,9 +150,8 @@ void MoveToFrontByKey(LRUCache *cache, uint64_t key) {
     return ;
 }
 
-// TODO: tmp don't know to use
 void removeByKey(LRUCache *cache, uint64_t key) {
-    uint64_t page_idx = key / ENTRY_PER_PAGE;
+    uint64_t page_idx = key;
     uint64_t index = hash(page_idx, cache->capacity);
 
     Node *pre = NULL;
@@ -157,6 +167,7 @@ void removeByKey(LRUCache *cache, uint64_t key) {
     }
     if (cur == NULL) {
         // node with key no exist in cache
+        femu_log("remov key not exist\n");
         return ;
     }
     if (pre == NULL) {
@@ -186,11 +197,11 @@ void removeByKey(LRUCache *cache, uint64_t key) {
     cache->count--;
 }
 
-// 新的Node-> page_idx 不管新的旧的
-uint64_t addNodeToCache(DFTLTable *d_maptbl, LRUCache *cache, LRUCache *nand_cache, Node *node, bool *evict_happen, uint64_t *evict_key ,uint64_t* lat) {
+// 新的Node-> page_idx 
+uint64_t addNodeToCache(DFTLTable *d_maptbl, LRUCache *cache, LRUCache *nand_cache, Node *node, bool *evict_happen, uint64_t *evict_key ,uint64_t* lat, struct ssd *ssd) {
     if (cache->count >= cache->capacity) {
         *evict_happen = true;
-        *evict_key = dftl_evict(d_maptbl, cache, nand_cache, lat);
+        *evict_key = dftl_evict(d_maptbl, cache, nand_cache, lat, ssd);
     }
 
     uint64_t index = hash(node->page_idx, cache->capacity);
@@ -206,22 +217,28 @@ uint64_t addNodeToCache(DFTLTable *d_maptbl, LRUCache *cache, LRUCache *nand_cac
     // update_map
     uint64_t bmp_idx = node->page_idx / 8;
     uint8_t  bit_idx  = node->page_idx % 8;
-    dftl_node_map_set_bit(&(cache->flash_bmp[bmp_idx]), bit_idx);
+    map_set_bit(&(cache->flash_bmp[bmp_idx]), bit_idx);
     
     return node->page_idx;
 }
 
-// TODO: full gc
+// before add 
 // same node.page_idx remove
 uint64_t addNodeToNandCache(LRUCache *nand_cache, Node *node) {
     uint64_t index = hash(node->page_idx, nand_cache->capacity); // index = node->page_idx;
-
+   // femu_log("remove_key: %lu\n", index);
+   // removeByKey(nand_cache, index);
     Node *cur = nand_cache->hashTable[index];
     node->hash_next = cur;
     nand_cache->hashTable[index] = node;
 
     addToFront(nand_cache, node);
     nand_cache->count++;
+
+    // update_map
+    uint64_t bmp_idx = node->page_idx / 8;
+    uint8_t  bit_idx  = node->page_idx % 8;
+    map_set_bit(&(nand_cache->flash_bmp[bmp_idx]), bit_idx);
 
     return node->page_idx;
 }
@@ -243,12 +260,11 @@ uint64_t lru_get(DFTLTable *d_maptbl, LRUCache *cache, uint64_t key, struct ssd*
     return UNMAPPED_PPA;
 }
 
-// (key, value) -> (lpa, ppa)
-void lru_put(DFTLTable *d_maptbl, LRUCache *cache,LRUCache *nand_cache,uint64_t key, uint64_t value ,uint64_t*lat, struct ssd* ssd) {
+void lru_put(DFTLTable *d_maptbl, LRUCache *cache,LRUCache *nand_cache,uint64_t key, uint64_t value, struct ssd* ssd, uint64_t *lat) {
     uint64_t page_idx = key / ENTRY_PER_PAGE;
     uint64_t hash_index = hash(page_idx, cache->capacity);
 
-    femu_log("[lru_put] lpa: %lu-> ppa: %lu, page_idx: %lu, cache_size: %lu\n", key, value, page_idx, cache->capacity);
+  //  femu_log("[lru_put] lpa: %lu-> ppa: %lu, page_idx: %lu, cache_size: %lu\n", key, value, page_idx, cache->capacity);
 
     Node *cur = cache->hashTable[hash_index];
     while (cur != NULL) {
@@ -261,22 +277,96 @@ void lru_put(DFTLTable *d_maptbl, LRUCache *cache,LRUCache *nand_cache,uint64_t 
         }
         cur = cur->hash_next;
     }
-    // this page_idx has not been created (New)
-    Node *new_node = createNode(page_idx, ssd);
-    new_node->l2p_entries[key % ENTRY_PER_PAGE] = value;
-    bool evict_happen = false;
-    uint64_t evict_key = UNMAPPED_PPA;
 
-    addNodeToCache(d_maptbl, cache, nand_cache, new_node, &evict_happen, &evict_key, lat);
+    uint64_t bmp_idx = page_idx / 8;
+    uint8_t  bit_idx = page_idx % 8;
+
+    // if (map_check_bit(&(d_maptbl->nand_cache->flash_bmp[bmp_idx]), bit_idx)) {
+    //     Node *old_node = nand_cache->hashTable[has_index];
+    //     Node *pre_ = NULL;
+
+    //     while (old_node != NULL) {
+    //         if (old_node->page_idx == page_idx) {
+    //             break;
+    //         }
+    //         pre_ = old_node;
+    //         old_node = old_node->hash_next;
+    //     }
+    //     if (old_node == NULL) {
+    //         femu_log("LRU_put error: %lu\n", page_idx);
+    //         return ;
+    //     }
+    //     old_node->l2p_entries[key % ENTRY_PER_PAGE] = value;
+    //     old_node->update_in_flash = true;
+
+    //     bool evict_happen = false;
+    //     uint64_t evict_key = UNMAPPED_PPA;
+    //     addNodeToCache(d_maptbl, cache, nand_cache, old_node, &evict_happen, &evict_key, lat, ssd);
+
+    //     // read_trans_tbl lat
+    //     uint64_t ppn;
+    //     ppn = get_gtd_ent(d_maptbl, page_idx);
+    //     if (ppn == UNMAPPED_PPA) {
+    //         ftl_err("[lru_put_trs_read] vpn: %lu,in nand_cache, but not in gtd\n", page_idx);
+    //         return 0;
+    //     }
+    //     struct ppa ppa;
+    //     ppa = pgidx2ppa(ssd, ppn);
+    //     struct nand_cmd trd;
+    //     trd.type = USER_IO;
+    //     trd.cmd  = NAND_READ;
+    //     trd.stime = 0;
+    //     ssd_advance_status(ssd, &ppa, &trd);
+
+
+    // }
+    // else {
+        // this page_idx has not been created (New)
+        Node *new_node = createNode(ssd, page_idx);
+        new_node->l2p_entries[key % ENTRY_PER_PAGE] = value;
+        bool evict_happen = false;
+        uint64_t evict_key = UNMAPPED_PPA;
+
+        addNodeToCache(d_maptbl, cache, nand_cache, new_node, &evict_happen, &evict_key, lat, ssd);
+    // }
+    return ;
+}
+
+void nand_cache_update(LRUCache *nand_cache,uint64_t key, uint64_t value) {
+    uint64_t page_idx = key / ENTRY_PER_PAGE;
+    uint64_t hash_index = hash(page_idx, nand_cache->capacity);
+
+
+    Node *cur = nand_cache->hashTable[hash_index];
+    while (cur != NULL) {
+        if (cur->page_idx == page_idx) {
+            // this node([page_idx][l2p_0~1024]) upadte, should be upadte in flash
+            cur->l2p_entries[key % ENTRY_PER_PAGE] = value;
+            cur->update_in_flash = true;
+            return ;
+        }
+        cur = cur->hash_next;
+    }
+    if (cur == NULL) {
+        femu_log("[GC_clean][nand_cache update] no_find key: %lu\n", key);
+    }
 
     return ;
 }
 
-// pop()  use lru strategy: least recently use node in cache
-uint64_t dftl_evict(DFTLTable *d_maptbl, LRUCache *cache, LRUCache* nand_cache,uint64_t* lat) {
+/**
+ * @brief dftl_evict
+ * 
+ * pop()  use lru strategy: least recently use node in cache
+ * 
+ */
+
+uint64_t dftl_evict(DFTLTable *d_maptbl, LRUCache *cache, LRUCache* nand_cache, uint64_t *lat, struct ssd* ssd) {
     if (cache->count >= cache->capacity) {
         Node *lastNode = cache->tail;
         if (lastNode) {
+            //femu_log("[dftl_evict]: evict happen, flush : %d\n", lastNode->update_in_flash ? 1 : 0);
+
             uint64_t has_index = hash(lastNode->page_idx, cache->capacity);
             Node *cur = cache->hashTable[has_index];
             Node *pre = NULL;
@@ -303,38 +393,22 @@ uint64_t dftl_evict(DFTLTable *d_maptbl, LRUCache *cache, LRUCache* nand_cache,u
 
                 uint64_t page_idx = lastNode->page_idx;      
                 
+                // 将CMT中dirty的Node flush to nand, update gtd
                 if (lastNode->update_in_flash) {
                     d_maptbl->counter.evit_cnt++;
                     
-                    // updae GTD, split point
-                    Point points[1024];
-                    int num_points = 0;
+                    // update gtd & write node_page to flash & simulat lat
+                    uint64_t wr_lat = 0;
+                    wr_lat = translation_page_write(ssd, page_idx);
+                    (*lat) += wr_lat;
+                    
+                    addNodeToNandCache(nand_cache, lastNode); 
+                    
 
-                    for (uint64_t i = 0; i < ENTRY_PER_PAGE; i++) {
-                        uint64_t lpn, ppn;
-                        lpn = i; // lpn % ENTRY_PER_PAGE
-                        ppn = lastNode->l2p_entries[i];
-
-                        if (ppn != UNMAPPED_PPA) {
-                            Point pt;
-                            pt.x = lpn, pt.y = ppn;
-                            points[num_points++] = pt;
-                        }
-                    }
-
-                    d_maptbl->GTD[page_idx].page_idx = page_idx;
-                    d_maptbl->GTD[page_idx].ppa      = lastNode->ppa;
-
-                    dftl_GTD_update(&d_maptbl->GTD[page_idx], points, num_points);
-
-
-                    addNodeToNandCache(nand_cache, lastNode);  // movetoflahs should add lat
-                    (*lat) += NAND_PROG_LATENCY;           // don't use lat += ssd_advance_status(ssd, &ppa, &swr); 模拟机制 should be used?
-
-                    // upate bitmap
+                    // upate CMT bitmap
                     uint64_t bmp_idx = lastNode->page_idx / 8;
                     uint8_t  bit_idx  = lastNode->page_idx % 8;
-                    dftl_node_map_clear_bit(&(cache->flash_bmp[bmp_idx]), bit_idx);
+                    map_clear_bit(&(cache->flash_bmp[bmp_idx]), bit_idx);
                 }
 
                 cache->count--;
@@ -348,8 +422,8 @@ uint64_t dftl_evict(DFTLTable *d_maptbl, LRUCache *cache, LRUCache* nand_cache,u
 }
 
 
-// 从 flash移出node应该保留 ？
-uint64_t move_node_from_nand_to_cache(DFTLTable *d_maptbl, LRUCache *cache, LRUCache *nand_cache, uint64_t key, uint64_t* lat) {
+// 从 flash移出node应该保留
+uint64_t move_node_from_nand_to_cache(DFTLTable *d_maptbl, LRUCache *cache, LRUCache *nand_cache, uint64_t key, uint64_t* lat, NvmeRequest *req, struct nand_lun *trans_lun, struct ssd *ssd) {
     uint64_t page_idx = key / ENTRY_PER_PAGE;
     uint64_t has_index = hash(page_idx, nand_cache->capacity);
     
@@ -368,35 +442,37 @@ uint64_t move_node_from_nand_to_cache(DFTLTable *d_maptbl, LRUCache *cache, LRUC
         return UNMAPPED_PPA;
     }
 
-    // should not update
     // update has_linklist one-dir
-    if (pre == NULL) {
-        nand_cache->hashTable[has_index] = nand_cache->hashTable[has_index]->hash_next;
-    } else {
-        pre->hash_next = cur->hash_next;
-    }
+    // if (pre == NULL) {
+    //     nand_cache->hashTable[has_index] = nand_cache->hashTable[has_index]->hash_next;
+    // } else {
+    //     pre->hash_next = cur->hash_next;
+    // }
 
-    // upate LRU_linklist two-dir
-    if (nand_cache->head == cur) {
-        nand_cache->head = cur->next;
-    }
-    if (nand_cache->tail == cur) {
-        nand_cache->tail = cur->pre;
-    }
+    // // upate LRU_linklist two-dir
+    // if (nand_cache->head == cur) {
+    //     nand_cache->head = cur->next;
+    // }
+    // if (nand_cache->tail == cur) {
+    //     nand_cache->tail = cur->pre;
+    // }
 
-    if (cur->pre != NULL) {
-        cur->pre->next = cur->next;
-    }
-    if (cur->next != NULL) {
-        cur->next->pre = cur->pre;
-    }
+    // if (cur->pre != NULL) {
+    //     cur->pre->next = cur->next;
+    // }
+    // if (cur->next != NULL) {
+    //     cur->next->pre = cur->pre;
+    // }
 
     uint64_t evict_key = UNMAPPED_PPA;
     bool evict_happen = false;
-    (*lat) += NAND_READ_LATENCY;   // don't use lat += ssd_advance_status(ssd, &ppa, &swr); 模拟机制 should not be used?
+   // (*lat) += NAND_READ_LATENCY;   
     cur->update_in_flash = false; 
 
-    addNodeToCache(d_maptbl, cache, nand_cache, cur, &evict_happen, &evict_key, lat);
+    (*lat) += translation_page_read(ssd, page_idx, req, trans_lun);
+    
+
+    addNodeToCache(d_maptbl, cache, nand_cache, cur, &evict_happen, &evict_key, lat, ssd);
 
     // uint64_t bmp_idx = cur->page_idx / 8;
     // uint8_t  bit_idx = cur->page_idx % 8;
@@ -404,7 +480,19 @@ uint64_t move_node_from_nand_to_cache(DFTLTable *d_maptbl, LRUCache *cache, LRUC
 
     //nand_cache->count--;
 
-    return cur->page_idx; // 
+    return cur->page_idx; 
+}
+
+void gtd_entry_init(G_map_entry *gtd) {
+    gtd->ppn = UNMAPPED_PPA;
+}
+
+uint64_t get_gtd_ent(DFTLTable *d_tbl, uint64_t vpn) {
+    return d_tbl->GTD[vpn].ppn;
+}
+
+void set_gtd_ent(DFTLTable *d_tbl, uint64_t vpn, uint64_t ppn) {
+    d_tbl->GTD[vpn].ppn = ppn;
 }
 
 DFTLTable* dftl_table_init(uint32_t tt_pages) {
@@ -418,7 +506,7 @@ DFTLTable* dftl_table_init(uint32_t tt_pages) {
 
     table->GTD = (G_map_entry *)malloc(sizeof(G_map_entry) * total_vpn);
     for (uint64_t i = 0; i < total_vpn; i++) {
-        gtd_entry_init(&table->GTD[i], i);
+        gtd_entry_init(&table->GTD[i]);
     }
 
     table->nand_cache = createLRUCache(total_vpn, bmp_cnt);
@@ -427,624 +515,1302 @@ DFTLTable* dftl_table_init(uint32_t tt_pages) {
     table->counter.group_read_cnt    = 0;
     table->counter.group_read_miss   = 0;
     table->counter.group_cmt_hit     = 0;
-    table->counter.group_double_read = 0;
+    table->counter.group_cmt_miss    = 0;
     table->counter.evit_cnt          = 0;
-
+    table->counter.gc_data_cnt       = 0;
+    table->counter.gc_trans_cnt       = 0;
     
+    table->counter.has_tbl = g_malloc0(sizeof(uint64_t) * tt_pages);
+    for (int i = 0; i < tt_pages; i++) {
+        table->counter.has_tbl[i] = 0;
+    }
+    table->counter.write_maxLBA = 0;
+    table->counter.write_minLBA = 16777216; // 64GB
 
     return table;
 }
 
-uint64_t dftl_get(DFTLTable *table, uint64_t lpa ,uint64_t* lat, struct ssd* ssd) {
-    uint64_t page_idx = lpa / ENTRY_PER_PAGE;
+uint64_t dftl_get(DFTLTable *table, uint64_t lpn ,uint64_t* lat, struct ssd* ssd, NvmeRequest *req, struct nand_lun *trans_lun) {
+    uint64_t page_idx = lpn / ENTRY_PER_PAGE;
     uint64_t bmp_idx = page_idx / 8;
     uint8_t  bit_idx = page_idx % 8;
 
-
-    if (!dftl_node_map_check_bit(&(table->CMT->flash_bmp[bmp_idx]), bit_idx)) { 
-        uint64_t evit_page_idx = move_node_from_nand_to_cache(table, table->CMT, table->nand_cache, lpa, lat);
+    if (!map_check_bit(&(table->CMT->flash_bmp[bmp_idx]), bit_idx)) {
+        uint64_t evit_page_idx = move_node_from_nand_to_cache(table, table->CMT, table->nand_cache, lpn, lat, req, trans_lun, ssd);
         if (evit_page_idx == UNMAPPED_PPA) {
             return evit_page_idx;
         }
-        table->counter.group_double_read++;
+        table->counter.group_cmt_miss++;
     } else {
         table->counter.group_cmt_hit++;
     }
 
-    u_int64_t ppa = lru_get(table, table->CMT, lpa, ssd);
-    femu_log("[dftl_get] lpa: %lu, page_idx: %lu, ret_ppa:%ld\n", lpa, page_idx, ppa == UNMAPPED_PPA ? -1 : ppa);
+    u_int64_t ppa = lru_get(table, table->CMT, lpn, ssd);
+    // femu_log("[dftl_get] lpa: %lu, page_idx: %lu, ret_ppa:%ld\n", lpa, page_idx, ppa == UNMAPPED_PPA ? -1 : ppa);
+    
+    // 一个问题 (1k读粒度导致) (读放大)
+    // 如果此时ppa == UNMAP说明 读的该lpa所在页号page_idx是存在，但是对应的lpa不存在(访问不存在的lpa)，粗粒度读缺失，造成多余的闪存访问延迟
 
     return ppa;
 
 }
-void dftl_put(DFTLTable* table, uint64_t lpa, uint64_t ppa , uint64_t* lat, struct ssd* ssd) {
-    // 写入的时候不用检查CMT是否有该页，直接写
-    // uint64_t page_idx = lpa / ENTRY_PER_PAGE;
-    // uint64_t bmp_idx = page_idx / 8;
-    // uint8_t  bit_idx = page_idx % 8;
-    // if (dftl_node_map_check_bit(&table->CMT->flash_bmp[bmp_idx], bit_idx)) {
-    //     move_node_from_nand_to_cache(table, table->nand_cache, lpa, lat);
-    // }
-    lru_put(table, table->CMT, table->nand_cache, lpa, ppa, lat, ssd);
+void dftl_put(DFTLTable* table, uint64_t lpn, uint64_t ppn, struct ssd *ssd, uint64_t *lat) {
+    lru_put(table, table->CMT, table->nand_cache, lpn, ppn, ssd, lat);
     return ;
 }
 
-
-
-// PLR_method
-int dftl_Segment_is_valid(Segment *seg, uint32_t x) {
-    if (!(x >= seg->x1 && x <= seg->x2))
-        return 0;
-    if (seg->accurate) {
-        int k = round(1.0/seg->k);
-        if (k != 0) {
-            if (((x - seg->x1) % k) != 0)
-                return 0;
-        } else {
-            // TODO
-        }
-    }
-    else {
-        if (seg->filter.length > 0 && (x - seg->x1) <= seg->filter.length) 
-            return seg->filter.bitmap[x - seg->x1];
-    }
-    return 1;
-}
-
-
-
-uint32_t dftl_Segment_gety(Segment *seg, bool check, uint32_t x) {
-    int predict = 0;
-    if (!check || dftl_Segment_is_valid(seg, x)) {
-            predict = (int)(x*seg->k + seg->b);
-            return predict;
-    }
-    return predict;
-}
-
-// 判断段属性: 精确性
-void dftl_Segment_check_properties(Segment *seg, Point *points, int num_points) {
-    seg->accurate = true, seg->consecutive = true;
-    
-    for (int i = 0; i < num_points; i++) {
-        uint32_t ppa;
-        ppa = dftl_Segment_gety(seg, false, points[i].x);
-        if (ppa != points[i].y) {
-            seg->accurate = false;
-        }
-        if (!seg->accurate) return ;
-    }
-}
-
-
-void dftl_Segment_init(Segment *seg, double k, double b, int x1, int x2, Point *points, int num_points) {
-    seg->k = k;
-    seg->b = b;
-    seg->x1 = x1;
-    seg->x2 = x2;
-    seg->accurate = true;
-      
-    seg->filter.length = 0;
-    seg->filter.bitmap = NULL;
-
-
-    if (points != NULL) {
-        dftl_Segment_check_properties(seg, points, num_points);
-
-        seg->filter.length = seg->x2 - seg->x1 + 1;
-        seg->filter.bitmap = (unsigned char *)malloc(seg->filter.length * sizeof(unsigned char));
-        memset(seg->filter.bitmap, 0, seg->filter.length * sizeof(unsigned char));
-
-        if (seg->filter.bitmap != NULL) {
-            memset(seg->filter.bitmap, 0, seg->filter.length * sizeof(unsigned char));
-            for (int i = 0; i < num_points; i++) {
-                seg->filter.bitmap[points[i].x - seg->x1] = 1;
-            } 
-        }
-    }
-}
-
-void dftl_Segment_merge(Segment *new_seg, Segment *old_seg, int *samelevel) {
-    if (0 && DeBUG) femu_log("new_seg.x1: %u, x2: %u, old_seg.x1: %u, old_seg.x2: %u\n", 
-                                    new_seg->x1, new_seg->x2, old_seg->x1, old_seg->x2);
-
-    int start = L_MIN(new_seg->x1, old_seg->x1);
-    int end   = L_MAX(new_seg->x2, old_seg->x2);
-
-    if (start == new_seg->x1 && end == new_seg->x2) {
-        *samelevel = -1;
-        return ;
-    }
-
-    if (new_seg->x1 > old_seg->x1 && new_seg->x1 <= old_seg->x2) {
-        old_seg->x2 = new_seg->x1 - 1;
-        *samelevel = 1;
-        
-        int k = 0;
-        int i = 0;
-        for (i = 0; i < old_seg->x2 - old_seg->x1 + 1; i++) {
-            old_seg->filter.bitmap[i] = old_seg->filter.bitmap[k++]; 
-        }
-        while (k < old_seg->filter.length) old_seg->filter.bitmap[k++] = 0;
-        return ;
-    }
-
-    if (old_seg->x1 > new_seg->x1 && old_seg->x1 <= new_seg->x2) {
-        *samelevel = 1;
-        
-        int k = new_seg->x2 - old_seg->x1 + 1;
-        int i = 0;
-        old_seg->x1 = new_seg->x2 + 1;
-        for (i = 0; i < old_seg->x2 - old_seg->x1 + 1; i++) {
-            if (k == old_seg->filter.length) break;
-            old_seg->filter.bitmap[i] = old_seg->filter.bitmap[k++];
-        }
-        while (i < old_seg->filter.length) old_seg->filter.bitmap[i++] = 0;
-        return ;
-    }
-    *samelevel = 0;   // 存在仍重叠 
-    return ;
-
-}
-
-
-
 /**
- * @brief SimpleSegment_method
+ * @brief ssd_method
+ * 
  * 
  */
 
-int dftl_get_y(SimpleSegment *simpleseg, int x) {
-    int predict;
-    predict = round(x * simpleseg->k + simpleseg->b);
-    return predict;
+
+static inline bool should_gc(struct ssd *ssd)
+{
+    return (ssd->lm.free_line_cnt <= ssd->sp.gc_thres_lines);
 }
 
-
-InsecPoint dftl_inter_section(SimpleSegment *s1, SimpleSegment *s2) {
-    InsecPoint insec_pt;
-    insec_pt.x = 0, insec_pt.y = 0;
-    // fix bug 如果两条直线平行或重叠是不会有交点的
-    if (s1->k != s2->k) {
-        insec_pt.x = (double) ((s2->b - s1->b) / (s1->k - s2->k));
-        insec_pt.y = (double) ((s1->k * s2->b - s2->k * s1->b) / (s1->k - s2->k));
-    }
-    return insec_pt;
+static inline bool should_gc_high(struct ssd *ssd)
+{
+    return (ssd->lm.free_line_cnt <= ssd->sp.gc_thres_lines_high);
 }
 
-bool dftl_is_above(Point *pt, SimpleSegment *s) {
-    return pt->y > (int)(s->k * pt->x + s->b);
+static inline struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
+{
+    return ssd->maptbl[lpn];
 }
 
-bool dftl_is_below(Point *pt, SimpleSegment *s) {
-    return pt->y < (int)(s->k * pt->x + s->b);
+static inline void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa)
+{
+    ftl_assert(lpn < ssd->sp.tt_pgs);
+    ssd->maptbl[lpn] = *ppa;
 }
 
-Point dftl_get_upper_bound(Point *pt, double gamma) {
-    Point p;
-    p.x = pt->x, p.y = pt->y + gamma;
-    return p;
+static uint64_t ppa2pgidx(struct ssd *ssd, struct ppa *ppa)
+{
+    struct ssdparams *spp = &ssd->sp;
+    uint64_t pgidx;
+
+    pgidx = ppa->g.ch  * spp->pgs_per_ch  + \
+            ppa->g.lun * spp->pgs_per_lun + \
+            ppa->g.pl  * spp->pgs_per_pl  + \
+            ppa->g.blk * spp->pgs_per_blk + \
+            ppa->g.pg;
+
+    ftl_assert(pgidx < spp->tt_pgs);
+
+    return pgidx;
 }
 
-Point dftl_get_lower_bound(Point *pt, double gamma) {
-    Point p;
-    p.x = pt->x, p.y = pt->y - gamma;
-    return p;
+static inline struct ppa pgidx2ppa(struct ssd *ssd, uint64_t pgidx)
+{
+    struct ssdparams *spp = &ssd->sp;
+    struct ppa ppa;
+    ppa.ppa = 0;
+    ppa.g.ch = pgidx / spp->pgs_per_ch;
+    ppa.g.lun = (pgidx - ppa.g.ch * spp->pgs_per_ch) / spp->pgs_per_lun;
+    ppa.g.pl = (pgidx - ppa.g.ch * spp->pgs_per_ch - ppa.g.lun * spp->pgs_per_lun) / spp->pgs_per_pl;
+    ppa.g.blk = (pgidx - ppa.g.ch * spp->pgs_per_ch - ppa.g.lun * spp->pgs_per_lun - 
+                ppa.g.pl  * spp->pgs_per_pl) / spp->pgs_per_blk;
+    ppa.g.pg = (pgidx - ppa.g.ch * spp->pgs_per_ch - ppa.g.lun * spp->pgs_per_lun - 
+                ppa.g.pl  * spp->pgs_per_pl - ppa.g.blk * spp->pgs_per_blk);
+
+    ftl_assert(pgidx < spp->tt_pgs);
+
+    return ppa;
 }
 
-SimpleSegment dftl_frompoints(Point p1, Point p2) {
-    SimpleSegment simplesegment;
-    if (p2.x != p1.x) {
-        simplesegment.k = (double)((double)(int32_t)(p2.y - p1.y) / (p2.x - p1.x));
-    }
-    if (p2.x != p1.x) {
-        simplesegment.b = (double)((double)(p1.y * p2.x) - (double)(p1.x * p2.y)) / (p2.x - p1.x);
-    }
-    simplesegment.x1 = p1.x;
-    simplesegment.x2 = p2.x;
-    return simplesegment;
-}
+// superblcok,superpage 's encode
+uint64_t ppa2vpgidx(struct ssd *ssd, struct ppa *ppa)
+{
+    struct ssdparams *spp = &ssd->sp;
+    uint64_t vpgidx;
 
-SimpleSegment dftl_frompoints_insec(InsecPoint p1, Point p2) {
-    SimpleSegment simplesegment;
-    if (p2.x != p1.x) {
-        simplesegment.k = (double)((double)((int32_t)p2.y - p1.y) / (p2.x - p1.x));
-    }
-    if (p2.x != p1.x) {
-        simplesegment.b = (double)((double)(p1.y * p2.x) - (double)(p1.x * p2.y)) / (p2.x - p1.x);
-    }
-    simplesegment.x1 = p1.x;
-    simplesegment.x2 = p2.x;
-    return simplesegment;
-}
-
-
-/**
- * @brief PLR_method
- * 
- */
-void dftl_plr_init(PLR* plr, double gamma) {
-    plr->gamma = gamma;
-    plr->max_length = ENTRY_PER_PAGE;
-
-    dftl_plr__init(plr);
-}
-
-
-// Tem_struct, use for build segments, and then destry after insert
-void dftl_plr__init(PLR* plr) {
-
-    // plr_destroy(plr);
-
-    plr->segments = g_malloc0(sizeof(Segment) * (plr->max_length));
-    for (int i = 0; i < plr->max_length; i++) {
-        dftl_Segment_init(&plr->segments[i], 0, 0, 0, 0, NULL, 0);
-    }
-    plr->num_segments = 0;
-
-    plr->s0.x = 0, plr->s0.y = 0;   // init point
-    plr->s1.x = 0, plr->s1.y = 0;
-    plr->rho_upper.k = 0, plr->rho_upper.b = 0, plr->rho_upper.x1 = 0, plr->rho_upper.x2 = 0;
-    plr->rho_lower.k = 0, plr->rho_lower.b = 0, plr->rho_lower.x1 = 0, plr->rho_lower.x2 = 0;
-    plr->sint.x = 0, plr->sint.y = 0;
-    plr->state = PLR_CONSTANTS_FIRST;
     
-    plr->points = NULL;
-    plr->num_points = 0;
+    vpgidx = ppa->g.blk * spp->pgs_per_line  + \
+             ppa->g.pg  * spp->blks_per_line + \
+             ppa->g.pl  * spp->luns_per_line + \
+             ppa->g.lun * spp->nchs          + \
+             ppa->g.ch;
 
+    ftl_assert(vpgidx < spp->tt_pgs);
+
+    return vpgidx;
 }
 
+static inline struct ppa vpgidx2ppa(struct ssd *ssd, uint64_t vpgidx)
+{
+    struct ssdparams *spp = &ssd->sp;
+    struct ppa ppa;
+    ppa.ppa = 0;
 
-void dftl_plr_add_segment(PLR *plr, Segment *seg) {
-    plr->segments[plr->num_segments % plr->max_length] = *seg;
-    plr->num_segments++;  
+
+    ppa.g.blk = vpgidx / spp->pgs_per_line;
+    ppa.g.pg  = (vpgidx - ppa.g.blk * spp->pgs_per_line) / spp->blks_per_line;
+    ppa.g.pl  = (vpgidx - ppa.g.blk * spp->pgs_per_line - ppa.g.pg * spp->blks_per_line) / spp->luns_per_line;
+    ppa.g.lun = (vpgidx - ppa.g.blk * spp->pgs_per_line - ppa.g.pg * spp->blks_per_line -
+                 ppa.g.pl * spp->luns_per_line) / spp->nchs;
+    ppa.g.ch  = (vpgidx - ppa.g.blk * spp->pgs_per_line - ppa.g.pg * spp->blks_per_line -
+                 ppa.g.pl * spp->luns_per_line - ppa.g.lun * spp->nchs);
+
+    ftl_assert(vpgidx < spp->tt_pgs);
+
+    return ppa;
 }
 
-void dftl_plr_destroy(PLR* plr) {
-    if (plr->segments != NULL) {
-        free(plr->segments);
-        plr->segments = NULL;
-        plr->num_segments = 0;
+static inline uint64_t get_rmap_ent(struct ssd *ssd, struct ppa *ppa)
+{
+    uint64_t pgidx = ppa2pgidx(ssd, ppa);
+
+    return ssd->rmap[pgidx];
+}
+
+/* set rmap[page_no(ppa)] -> lpn */
+static inline void set_rmap_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa)
+{
+    uint64_t pgidx = ppa2pgidx(ssd, ppa);
+
+    ssd->rmap[pgidx] = lpn;
+}
+
+static inline int victim_line_cmp_pri(pqueue_pri_t next, pqueue_pri_t curr)
+{
+    return (next > curr);
+}
+
+static inline pqueue_pri_t victim_line_get_pri(void *a)
+{
+    return ((struct line *)a)->vpc;
+}
+
+static inline void victim_line_set_pri(void *a, pqueue_pri_t pri)
+{
+    ((struct line *)a)->vpc = pri;
+}
+
+static inline size_t victim_line_get_pos(void *a)
+{
+    return ((struct line *)a)->pos;
+}
+
+static inline void victim_line_set_pos(void *a, size_t pos)
+{
+    ((struct line *)a)->pos = pos;
+}
+
+static void ssd_init_lines(struct ssd *ssd)
+{
+    struct ssdparams *spp = &ssd->sp;
+    struct line_mgmt *lm = &ssd->lm;
+    struct line *line;
+
+    lm->tt_lines = spp->blks_per_pl;
+    ftl_assert(lm->tt_lines == spp->tt_lines);
+    lm->lines = g_malloc0(sizeof(struct line) * lm->tt_lines);
+
+    QTAILQ_INIT(&lm->free_line_list);
+    lm->victim_line_pq = pqueue_init(spp->tt_lines, victim_line_cmp_pri,
+            victim_line_get_pri, victim_line_set_pri,
+            victim_line_get_pos, victim_line_set_pos);
+    QTAILQ_INIT(&lm->full_line_list);
+
+    lm->free_line_cnt = 0;
+    for (int i = 0; i < lm->tt_lines; i++) {
+        line = &lm->lines[i];
+        line->id = i;
+        line->ipc = 0;
+        line->vpc = 0;
+        line->pos = 0;
+        line->type = DATA;
+        /* initialize all the lines as free lines */
+        QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
+        lm->free_line_cnt++;
     }
-    if (plr->points != NULL) {
-        free(plr->points);
-        plr->points = NULL;
-        plr->num_points = 0;        
+
+    ftl_assert(lm->free_line_cnt == lm->tt_lines);
+    lm->victim_line_cnt = 0;
+    lm->full_line_cnt = 0;
+}
+
+static void ssd_init_write_pointer(struct ssd *ssd, int type)
+{
+    struct write_pointer *wpp;
+    if (type == TRANS) {
+        wpp = &ssd->t_wp;
+    } else {
+        wpp = &ssd->d_wp;
+    }
+
+    struct line_mgmt *lm = &ssd->lm;
+    struct line *curline = NULL;
+
+    curline = QTAILQ_FIRST(&lm->free_line_list);
+    QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
+    lm->free_line_cnt--;
+
+    /* wpp->curline is always our next-to-write super-block */
+    wpp->curline = curline;
+    wpp->ch = 0;
+    wpp->lun = 0;
+    wpp->pg = 0;
+    //wpp->blk = 0;
+    wpp->blk = curline->id;
+    wpp->pl = 0;
+
+    if (type == TRANS) {
+        wpp->curline->type = TRANS;
+    } else {
+        wpp->curline->type = DATA;
     }
 }
 
-int dftl_build_segment(PLR* plr, Segment *seg) {
-        if (plr->state == PLR_CONSTANTS_FIRST) { 
-            seg = NULL;
-            return 0;
-        }
-        // 建立单点段
-        else if (plr->state == PLR_CONSTANTS_SECOND) {
-            dftl_Segment_init(seg, 1, plr->s0.y - plr->s0.x, plr->s0.x, plr->s0.x, plr->points, plr->num_points);
-        }
+static inline void check_addr(int a, int max)
+{
+    ftl_assert(a >= 0 && a < max);
+}
 
-        // 建立多点段
-        else if (plr->state == PLR_CONSTANTS_READY) {
-            double avg_slope = ((plr->rho_lower.k + plr->rho_upper.k) / 2.0);
-            double intercept = 0;
-            if (plr->sint.x == 0 && plr->sint.y == 0) {
-                // intercept = -avg_slope * plr->s0.x + plr->s0.y;    // 不精确
-                avg_slope = plr->rho_lower.k;
-                intercept = plr->rho_lower.b;
-            } else {
-                intercept = -avg_slope * plr->sint.x + plr->sint.y;
+static struct line *get_next_free_line(struct ssd *ssd)
+{
+    struct line_mgmt *lm = &ssd->lm;
+    struct line *curline = NULL;
+
+    curline = QTAILQ_FIRST(&lm->free_line_list);
+    if (!curline) {
+        ftl_err("No free lines left in [%s] !!!!\n", ssd->ssdname);
+        return NULL;
+    }
+
+    QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
+    lm->free_line_cnt--;
+    return curline;
+}
+
+void ssd_advance_write_pointer(struct ssd *ssd, int type)
+{
+    struct ssdparams *spp = &ssd->sp;
+    struct write_pointer *wpp;
+    if (type == TRANS) {
+        wpp = &ssd->t_wp;
+    } else {
+        wpp = &ssd->d_wp;
+    }
+
+    struct line_mgmt *lm = &ssd->lm;
+    check_addr(wpp->ch, spp->nchs);
+    wpp->ch++;
+    if (wpp->ch == spp->nchs) {
+        wpp->ch = 0;
+        check_addr(wpp->lun, spp->luns_per_ch);
+        wpp->lun++;
+        /* in this case, we should go to next lun */
+        if (wpp->lun == spp->luns_per_ch) {
+            wpp->lun = 0;
+            /* go to next page in the block */
+            check_addr(wpp->pg, spp->pgs_per_blk);
+            wpp->pg++;
+            if (wpp->pg == spp->pgs_per_blk) {
+                wpp->pg = 0;
+                /* move current line to {victim,full} line list */
+                // 超级块写满了
+                if (wpp->curline->vpc == spp->pgs_per_line) {
+                    /* all pgs are still valid, move to full line list */
+                    ftl_assert(wpp->curline->ipc == 0);
+                    QTAILQ_INSERT_TAIL(&lm->full_line_list, wpp->curline, entry);
+                    lm->full_line_cnt++; // 满了且全是有效页
+                } else {
+                    ftl_assert(wpp->curline->vpc >= 0 && wpp->curline->vpc < spp->pgs_per_line);
+                    /* there must be some invalid pages in this line */
+                    ftl_assert(wpp->curline->ipc > 0);
+                    // 将超级块放到gc victim优先队列中
+                    pqueue_insert(lm->victim_line_pq, wpp->curline);
+                    lm->victim_line_cnt++;
+                }
+                /* current line is used up, pick another empty line */
+                check_addr(wpp->blk, spp->blks_per_pl);
+                wpp->curline = NULL;
+                wpp->curline = get_next_free_line(ssd);
+                if (!wpp->curline) {
+                    /* TODO */
+                    femu_log("!wpp->curline\n");
+                    abort();
+                }
+                if (type == TRANS) {
+                    wpp->curline->type = TRANS;
+                } else {
+                    wpp->curline->type = DATA;
+                }
+
+                wpp->blk = wpp->curline->id;
+                femu_log("获取的超级块id:%d, 类型: %s, lm.full_cnt: %d, lm.vim_cnt: %d, lm.free_cnt: %d\n", wpp->curline->id, wpp->curline->type == TRANS ? "TRANS" : "DATA", 
+                                                    lm->full_line_cnt, lm->victim_line_cnt, lm->free_line_cnt);
                 
+                check_addr(wpp->blk, spp->blks_per_pl);
+                /* make sure we are starting from page 0 in the super block */
+                ftl_assert(wpp->pg == 0);
+                ftl_assert(wpp->lun == 0);
+                ftl_assert(wpp->ch == 0);
+                /* TODO: assume # of pl_per_lun is 1, fix later */
+                ftl_assert(wpp->pl == 0);
             }
-            dftl_Segment_init(seg, avg_slope, intercept, plr->s0.x, plr->s1.x, plr->points, plr->num_points);
         }
-        return 1;
+    }
 }
 
-bool dftl_should_stop(PLR* plr, Point *point) {
-    if (plr->s1.x == 0) {
-        if (point->x > plr->s0.x + plr->max_length || point->x <= plr->s0.x) return true;  // 段的横向长度
-    }else if (point->x > plr->s1.x + plr->max_length || point->x <= plr->s1.x) return true;
+struct ppa get_new_page(struct ssd *ssd, int type)
+{
+    struct write_pointer *wpp;
+    if (type == TRANS) {
+        wpp = &ssd->t_wp;
+    } else {
+        wpp = &ssd->d_wp;
+    }
+    struct ppa ppa;
+    ppa.ppa = 0;
+    ppa.g.ch = wpp->ch;
+    ppa.g.lun = wpp->lun;
+    ppa.g.pg = wpp->pg;
+    ppa.g.blk = wpp->blk;
+    ppa.g.pl = wpp->pl;
+    ftl_assert(ppa.g.pl == 0);
+
+    return ppa;
+}
+
+static void check_params(struct ssdparams *spp)
+{
+    /*
+     * we are using a general write pointer increment method now, no need to
+     * force luns_per_ch and nchs to be power of 2
+     */
+
+    //ftl_assert(is_power_of_2(spp->luns_per_ch));
+    //ftl_assert(is_power_of_2(spp->nchs));
+}
+
+static void ssd_init_params(struct ssdparams *spp)
+{
+    spp->secsz = 512;
+    spp->secs_per_pg = 8;
+    spp->pgs_per_blk = 512; //*2 = 32GB
+    spp->blks_per_pl = 256; /*1 = 16GB */
+    spp->pls_per_lun = 1;
+    spp->luns_per_ch = 8;
+    spp->nchs = 8;
+
+    spp->pg_rd_lat = NAND_READ_LATENCY;
+    spp->pg_wr_lat = NAND_PROG_LATENCY;
+    spp->blk_er_lat = NAND_ERASE_LATENCY;
+    spp->ch_xfer_lat = 0;
+
+    /* calculated values */
+    spp->secs_per_blk = spp->secs_per_pg * spp->pgs_per_blk;
+    spp->secs_per_pl = spp->secs_per_blk * spp->blks_per_pl;
+    spp->secs_per_lun = spp->secs_per_pl * spp->pls_per_lun;
+    spp->secs_per_ch = spp->secs_per_lun * spp->luns_per_ch;
+    spp->tt_secs = spp->secs_per_ch * spp->nchs;
+
+    spp->pgs_per_pl = spp->pgs_per_blk * spp->blks_per_pl;
+    spp->pgs_per_lun = spp->pgs_per_pl * spp->pls_per_lun;
+    spp->pgs_per_ch = spp->pgs_per_lun * spp->luns_per_ch;
+    spp->tt_pgs = spp->pgs_per_ch * spp->nchs;
+
+    spp->blks_per_lun = spp->blks_per_pl * spp->pls_per_lun;
+    spp->blks_per_ch = spp->blks_per_lun * spp->luns_per_ch;
+    spp->tt_blks = spp->blks_per_ch * spp->nchs;
+
+    spp->pls_per_ch =  spp->pls_per_lun * spp->luns_per_ch;
+    spp->tt_pls = spp->pls_per_ch * spp->nchs;
+
+    spp->tt_luns = spp->luns_per_ch * spp->nchs;  // 16GB  8 * 8 = 64
+
+    /* line is special, put it at the end */
+    spp->blks_per_line = spp->tt_luns * 1; /* TODO: to fix under multiplanes */ // no多通道 plane = 1
+    spp->pgs_per_line = spp->blks_per_line * spp->pgs_per_blk;
+    spp->secs_per_line = spp->pgs_per_line * spp->secs_per_pg;
+    spp->tt_lines = spp->blks_per_lun; /* TODO: to fix under multiplanes */
+
+    // super_block == line
+    // 32 GB
+    spp->luns_per_line = spp->nchs * spp->luns_per_ch;          // 64
+    spp->pls_per_line = spp->luns_per_line * spp->pls_per_lun;  // 64 
+    spp->blks_per_line = spp->pls_per_line;                     // 64 (blks_per_line = pages_per_superpagd) 
+
+    spp->pgs_per_line = spp->blks_per_line * spp->pgs_per_blk;  // 64 * 512 = 32768 pages
+
+
+    spp->gc_thres_pcent = 0.75;
+    spp->gc_thres_lines = (int)((1 - spp->gc_thres_pcent) * spp->tt_lines);
+    spp->gc_thres_pcent_high = 0.95;
+    spp->gc_thres_lines_high = (int)((1 - spp->gc_thres_pcent_high) * spp->tt_lines);
+    spp->enable_gc_delay = true;
+
+
+    check_params(spp);
+}
+
+static void ssd_init_nand_page(struct nand_page *pg, struct ssdparams *spp)
+{
+    pg->nsecs = spp->secs_per_pg;
+    pg->sec = g_malloc0(sizeof(nand_sec_status_t) * pg->nsecs);
+    for (int i = 0; i < pg->nsecs; i++) {
+        pg->sec[i] = SEC_FREE;
+    }
+    pg->status = PG_FREE;
+}
+
+static void ssd_init_nand_blk(struct nand_block *blk, struct ssdparams *spp)
+{
+    blk->npgs = spp->pgs_per_blk;
+    blk->pg = g_malloc0(sizeof(struct nand_page) * blk->npgs);
+    for (int i = 0; i < blk->npgs; i++) {
+        ssd_init_nand_page(&blk->pg[i], spp);
+    }
+    blk->ipc = 0;
+    blk->vpc = 0;
+    blk->erase_cnt = 0;
+    blk->wp = 0;
+}
+
+static void ssd_init_nand_plane(struct nand_plane *pl, struct ssdparams *spp)
+{
+    pl->nblks = spp->blks_per_pl;
+    pl->blk = g_malloc0(sizeof(struct nand_block) * pl->nblks);
+    for (int i = 0; i < pl->nblks; i++) {
+        ssd_init_nand_blk(&pl->blk[i], spp);
+    }
+}
+
+static void ssd_init_nand_lun(struct nand_lun *lun, struct ssdparams *spp)
+{
+    lun->npls = spp->pls_per_lun;
+    lun->pl = g_malloc0(sizeof(struct nand_plane) * lun->npls);
+    for (int i = 0; i < lun->npls; i++) {
+        ssd_init_nand_plane(&lun->pl[i], spp);
+    }
+    lun->next_lun_avail_time = 0;
+    lun->busy = false;
+}
+
+static void ssd_init_ch(struct ssd_channel *ch, struct ssdparams *spp)
+{
+    ch->nluns = spp->luns_per_ch;
+    ch->lun = g_malloc0(sizeof(struct nand_lun) * ch->nluns);
+    for (int i = 0; i < ch->nluns; i++) {
+        ssd_init_nand_lun(&ch->lun[i], spp);
+    }
+    ch->next_ch_avail_time = 0;
+    ch->busy = 0;
+}
+
+static void ssd_init_maptbl(struct ssd *ssd)
+{
+    struct ssdparams *spp = &ssd->sp;
+
+    ssd->maptbl = g_malloc0(sizeof(struct ppa) * spp->tt_pgs);
+    for (int i = 0; i < spp->tt_pgs; i++) {
+        ssd->maptbl[i].ppa = UNMAPPED_PPA;
+    }
+
+}
+
+static void ssd_init_rmap(struct ssd *ssd)
+{
+    struct ssdparams *spp = &ssd->sp;
+
+    ssd->rmap = g_malloc0(sizeof(uint64_t) * spp->tt_pgs);
+    for (int i = 0; i < spp->tt_pgs; i++) {
+        ssd->rmap[i] = INVALID_LPN;
+    }
+}
+
+void ssd_init(FemuCtrl *n)
+{
+    struct ssd *ssd = n->ssd;
+    struct ssdparams *spp = &ssd->sp;
+
+    ftl_assert(ssd);
+
+
+    ssd_init_params(spp);
+    
+    
+    /* initialize ssd internal layout architecture */
+    ssd->ch = g_malloc0(sizeof(struct ssd_channel) * spp->nchs);
+    for (int i = 0; i < spp->nchs; i++) {
+        ssd_init_ch(&ssd->ch[i], spp);
+    }
+
+    /* initialize maptbl */
+    ssd_init_maptbl(ssd);
+
+    /* initialize rmap */
+    ssd_init_rmap(ssd);
+
+
+    // 初始化 DFTLTable
+    ssd->d_maptbl = dftl_table_init(ssd->sp.tt_pgs);
+    ssd->pass = 0;
+
+    /* initialize all the lines */
+    ssd_init_lines(ssd);
+
+    /* initialize write pointer, this is how we allocate new pages for writes */
+    // two wps: data_wp, trans_wp;
+    ssd_init_write_pointer(ssd, DATA);
+    ssd_init_write_pointer(ssd, TRANS);
+
+    qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
+                       QEMU_THREAD_JOINABLE);
+}
+
+static inline bool valid_ppa(struct ssd *ssd, struct ppa *ppa)
+{
+    struct ssdparams *spp = &ssd->sp;
+    int ch = ppa->g.ch;
+    int lun = ppa->g.lun;
+    int pl = ppa->g.pl;
+    int blk = ppa->g.blk;
+    int pg = ppa->g.pg;
+    int sec = ppa->g.sec;
+
+    if (ch >= 0 && ch < spp->nchs && lun >= 0 && lun < spp->luns_per_ch && pl >=
+        0 && pl < spp->pls_per_lun && blk >= 0 && blk < spp->blks_per_pl && pg
+        >= 0 && pg < spp->pgs_per_blk && sec >= 0 && sec < spp->secs_per_pg)
+        return true;
 
     return false;
 }
 
-
-// up and lower 有界误差范围的线性回归学习
-int dftl_process_point(PLR* plr, Point* point, Segment *seg) {
-
-    int ret = 0;
-    if (plr->state == PLR_CONSTANTS_FIRST) {
-        plr->s0 = *point;
-        plr->state = PLR_CONSTANTS_SECOND;
-    } else if (plr->state == PLR_CONSTANTS_SECOND) {
-        if (dftl_should_stop(plr, point)) {
-            ret = dftl_build_segment(plr, seg);    //这里建
-
-            plr->s0 = *point;
-            plr->s1.x = 0, plr->s1.y = 0;
-            plr->rho_upper.k = 0, plr->rho_upper.b = 0, plr->rho_upper.x1 = 0, plr->rho_upper.x2 = 0;
-            plr->rho_lower.k = 0, plr->rho_lower.b = 0, plr->rho_lower.x1 = 0, plr->rho_lower.x2 = 0;
-            plr->sint.x = 0, plr->sint.y = 0;
-            plr->state = PLR_CONSTANTS_SECOND;
-
-            free(plr->points);
-            plr->points = NULL;
-            plr->num_points = 0;
-        }else{
-            plr->s1 = *point;
-            plr->rho_lower = dftl_frompoints(dftl_get_upper_bound(&plr->s0, plr->gamma), 
-                                                    dftl_get_lower_bound(&plr->s1, plr->gamma));
-            plr->rho_upper = dftl_frompoints(dftl_get_lower_bound(&plr->s0, plr->gamma), 
-                                                    dftl_get_upper_bound(&plr->s1, plr->gamma));            
-            plr->sint = dftl_inter_section(&plr->rho_upper, &plr->rho_lower);
-
-            plr->state = PLR_CONSTANTS_READY;
-        }
-    } else if (plr->state == PLR_CONSTANTS_READY) {
-        // 如果这个点既不在下界上面也不在上界下面而且x坐标距离已经超出了s0开始的值() 则建段
-        if (dftl_is_below(point, &plr->rho_lower) || dftl_is_above(point, &plr->rho_upper) || dftl_should_stop(plr, point)) {
-            ret = dftl_build_segment(plr, seg);     
-
-            plr->s0 = *point;
-            plr->s1.x = 0, plr->s1.y = 0;
-            plr->rho_upper.k = 0, plr->rho_upper.b = 0, plr->rho_upper.x1 = 0, plr->rho_upper.x2 = 0;
-            plr->rho_lower.k = 0, plr->rho_lower.b = 0, plr->rho_lower.x1 = 0, plr->rho_lower.x2 = 0;
-            plr->sint.x = 0, plr->sint.y = 0;
-            plr->state = PLR_CONSTANTS_SECOND;
-
-            free(plr->points);
-            plr->points = NULL;
-            plr->num_points = 0;
-        }else {
-            plr->s1 = *point;
-
-            Point s_upper = dftl_get_upper_bound(point, plr->gamma);
-            Point s_lower = dftl_get_lower_bound(point, plr->gamma);
-
-            if (dftl_is_below(&s_upper, &plr->rho_upper)) 
-                plr->rho_upper = dftl_frompoints_insec(plr->sint, s_upper);
-            if (dftl_is_above(&s_lower, &plr->rho_lower)) 
-                plr->rho_lower = dftl_frompoints_insec(plr->sint, s_lower);
-        }
-    }
-
-    if (plr->num_points == 0) {
-            plr->points = (Point *)malloc(sizeof(Point));
-    } else {
-        plr->points = (Point *)realloc(plr->points, (plr->num_points + 1) * sizeof(Point));
-    }
-    plr->points[plr->num_points] = *point;
-    plr->num_points++;
-
-    return ret;
+static inline bool valid_lpn(struct ssd *ssd, uint64_t lpn)
+{
+    return (lpn < ssd->sp.tt_pgs);
 }
 
-void dftl_plr_learn(PLR* plr, Point* points, int num_points) {
-    // femu_log("[plr_learn]: in\n");
-
-    for (int i = 0; i < num_points; i++) {
-        Segment seg;
-        dftl_Segment_init(&seg, 0, 0, 0, 0, NULL, 0);
-        int ret = dftl_process_point(plr, &points[i], &seg);
-        if (ret) {
-            dftl_plr_add_segment(plr, &seg);
-        }
-    }
-
-    Segment final_seg;
-    dftl_Segment_init(&final_seg, 0, 0, 0, 0, NULL, 0);
-    int ret = dftl_build_segment(plr, &final_seg);
-   //femu_log("[process_pt]: 段学习完成, 总共点数:%d\n", plr->num_points);
-    if (ret) {
-           // femu_log("[plr_learn]: 学习成功后添加段(最后的段)\n");
-            plr_add_segment(plr, &final_seg);
-    }
-
-    return ;
+static inline bool mapped_ppa(struct ppa *ppa)
+{
+    return !(ppa->ppa == UNMAPPED_PPA);
 }
 
-void dftl_GTD_update(G_map_entry *gtd, Point* points, int num_points) {
-    
-    dftl_plr__init(&gtd->plr);
-    dftl_plr_learn(&gtd->plr, points, num_points);
-    
-    
-    if (0 && DeBUG) {
-        for (int i = 0; i < gtd->plr.num_segments; i++) {
-            Segment seg = gtd->plr.segments[i];
-            femu_log("[gtd_update][plr_Segment %d]: k: %.2f, b: %.2f, x1: %u, x2: %u, %s, %s\n", i,
-                seg.k, seg.b, seg.x1, seg.x2, seg.accurate ? "精确":"不精确", seg.consecutive ? "连续":"不连续");
-        }
-    }
-
-    gtd_add_segments(gtd, gtd->segments, gtd->num_segments); 
-    
-    if (0 && DeBUG) {
-        femu_log("[gtd_update]: 此次segs索引段添加到gtd完成, 此时的gtd[%lu]信息如下:\n", gtd->page_idx);
-        dftl_print_gtd(gtd);
-    }
-
-    dftl_plr_destroy(&gtd->plr);    
+static inline struct ssd_channel *get_ch(struct ssd *ssd, struct ppa *ppa)
+{
+    return &(ssd->ch[ppa->g.ch]);
 }
 
-int32_t dftl_binary_search(G_map_entry *gtd, Segment *seg) {
-    int32_t left = 0;
-    int32_t right = gtd->num_segments - 1;
-    int32_t mid = 0;
-    int32_t target = seg->x1;
-    while (left < right) {
-        mid = (left + right) >> 1;
-        //femu_log("[begin] left:%u, right:%u, mid:%u\n",left, right, mid);
-        if (gtd->segments[mid].x1 >= target) {
-            right = mid;
+static inline struct nand_lun *get_lun(struct ssd *ssd, struct ppa *ppa)
+{
+    struct ssd_channel *ch = get_ch(ssd, ppa);
+    return &(ch->lun[ppa->g.lun]);
+}
+
+static inline struct nand_plane *get_pl(struct ssd *ssd, struct ppa *ppa)
+{
+    struct nand_lun *lun = get_lun(ssd, ppa);
+    return &(lun->pl[ppa->g.pl]);
+}
+
+static inline struct nand_block *get_blk(struct ssd *ssd, struct ppa *ppa)
+{
+    struct nand_plane *pl = get_pl(ssd, ppa);
+    return &(pl->blk[ppa->g.blk]);
+}
+
+static inline struct line *get_line(struct ssd *ssd, struct ppa *ppa)
+{
+    return &(ssd->lm.lines[ppa->g.blk]);
+}
+
+static inline struct nand_page *get_pg(struct ssd *ssd, struct ppa *ppa)
+{
+    struct nand_block *blk = get_blk(ssd, ppa);
+    return &(blk->pg[ppa->g.pg]);
+}
+
+static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct
+        nand_cmd *ncmd)
+{
+    int c = ncmd->cmd;
+    uint64_t cmd_stime = (ncmd->stime == 0) ? \
+        qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : ncmd->stime;
+    uint64_t nand_stime;
+    struct ssdparams *spp = &ssd->sp;
+    struct nand_lun *lun = get_lun(ssd, ppa);
+    uint64_t lat = 0;
+
+    switch (c) {
+    case NAND_READ:
+        /* read: perform NAND cmd first */
+        nand_stime = (lun->next_lun_avail_time < cmd_stime) ? cmd_stime : \
+                     lun->next_lun_avail_time;
+        lun->next_lun_avail_time = nand_stime + spp->pg_rd_lat;
+        lat = lun->next_lun_avail_time - cmd_stime;
+#if 0
+        lun->next_lun_avail_time = nand_stime + spp->pg_rd_lat;
+
+        /* read: then data transfer through channel */
+        chnl_stime = (ch->next_ch_avail_time < lun->next_lun_avail_time) ? \
+            lun->next_lun_avail_time : ch->next_ch_avail_time;
+        ch->next_ch_avail_time = chnl_stime + spp->ch_xfer_lat;
+
+        lat = ch->next_ch_avail_time - cmd_stime;
+#endif
+        break;
+
+    case NAND_WRITE:
+        /* write: transfer data through channel first */
+        nand_stime = (lun->next_lun_avail_time < cmd_stime) ? cmd_stime : \
+                     lun->next_lun_avail_time;
+        if (ncmd->type == USER_IO) {
+            lun->next_lun_avail_time = nand_stime + spp->pg_wr_lat;
         } else {
-            left = mid + 1;
+            lun->next_lun_avail_time = nand_stime + spp->pg_wr_lat;
         }
-       // fprintf("[end] left:%u, right:%u, mid:%u\n",left, right, mid);
+        lat = lun->next_lun_avail_time - cmd_stime;
+
+#if 0
+        chnl_stime = (ch->next_ch_avail_time < cmd_stime) ? cmd_stime : \
+                     ch->next_ch_avail_time;
+        ch->next_ch_avail_time = chnl_stime + spp->ch_xfer_lat;
+
+        /* write: then do NAND program */
+        nand_stime = (lun->next_lun_avail_time < ch->next_ch_avail_time) ? \
+            ch->next_ch_avail_time : lun->next_lun_avail_time;
+        lun->next_lun_avail_time = nand_stime + spp->pg_wr_lat;
+
+        lat = lun->next_lun_avail_time - cmd_stime;
+#endif
+        break;
+
+    case NAND_ERASE:
+        /* erase: only need to advance NAND status */
+        nand_stime = (lun->next_lun_avail_time < cmd_stime) ? cmd_stime : \
+                     lun->next_lun_avail_time;
+        lun->next_lun_avail_time = nand_stime + spp->blk_er_lat;
+
+        lat = lun->next_lun_avail_time - cmd_stime;
+        break;
+
+    default:
+        ftl_err("Unsupported NAND command: 0x%x\n", c);
     }
-    return left;
+
+    return lat;
+}
+
+/* update SSD status about one page from PG_VALID -> PG_VALID */
+static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
+{
+    struct line_mgmt *lm = &ssd->lm;
+    struct ssdparams *spp = &ssd->sp;
+    struct nand_block *blk = NULL;
+    struct nand_page *pg = NULL;
+    bool was_full_line = false;
+    struct line *line;
+
+    /* update corresponding page status */
+    pg = get_pg(ssd, ppa);
+    ftl_assert(pg->status == PG_VALID);
+    pg->status = PG_INVALID;
+
+    /* update corresponding block status */
+    blk = get_blk(ssd, ppa);
+    ftl_assert(blk->ipc >= 0 && blk->ipc < spp->pgs_per_blk);
+    blk->ipc++;
+    ftl_assert(blk->vpc > 0 && blk->vpc <= spp->pgs_per_blk);
+    blk->vpc--;
+
+    /* update corresponding line status */
+    line = get_line(ssd, ppa);
+
+    ftl_assert(line->ipc >= 0 && line->ipc < spp->pgs_per_line);
+    if (line->vpc == spp->pgs_per_line) {
+        ftl_assert(line->ipc == 0);
+        was_full_line = true;
+    }
+    line->ipc++;
+    ftl_assert(line->vpc > 0 && line->vpc <= spp->pgs_per_line);
+    /* Adjust the position of the victime line in the pq under over-writes */
+    if (line->pos) {
+        /* Note that line->vpc will be updated by this call */
+        pqueue_change_priority(lm->victim_line_pq, line->vpc - 1, line);
+    } else {
+        line->vpc--;
+    }
+
+    if (was_full_line) {
+        /* move line: "full" -> "victim" */
+        QTAILQ_REMOVE(&lm->full_line_list, line, entry);
+        lm->full_line_cnt--;
+        pqueue_insert(lm->victim_line_pq, line);
+        lm->victim_line_cnt++;
+    }
+}
+
+static void mark_page_valid(struct ssd *ssd, struct ppa *ppa)
+{
+    struct nand_block *blk = NULL;
+    struct nand_page *pg = NULL;
+    struct line *line;
+
+    /* update page status */
+    pg = get_pg(ssd, ppa);
+    ftl_assert(pg->status == PG_FREE);
+    pg->status = PG_VALID;
+
+    /* update corresponding block status */
+    blk = get_blk(ssd, ppa);
+    ftl_assert(blk->vpc >= 0 && blk->vpc < ssd->sp.pgs_per_blk);
+    blk->vpc++;
+
+    /* update corresponding line status */
+    line = get_line(ssd, ppa);
+    ftl_assert(line->vpc >= 0 && line->vpc < ssd->sp.pgs_per_line);
+    line->vpc++;
+}
+
+static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
+{
+    struct ssdparams *spp = &ssd->sp;
+    struct nand_block *blk = get_blk(ssd, ppa);
+    struct nand_page *pg = NULL;
+
+    for (int i = 0; i < spp->pgs_per_blk; i++) {
+        /* reset page status */
+        pg = &blk->pg[i];
+        ftl_assert(pg->nsecs == spp->secs_per_pg);
+        pg->status = PG_FREE;
+    }
+
+    /* reset block status */
+    ftl_assert(blk->npgs == spp->pgs_per_blk);
+    blk->ipc = 0;
+    blk->vpc = 0;
+    blk->erase_cnt++;
+}
+
+/*
+* @brief translation_page method (Normal & GC)
+*
+*/
+static uint64_t translation_page_read(struct ssd *ssd, uint64_t vpn, NvmeRequest *req, struct nand_lun *trans_lun) {
+    struct ppa ppa;
+    uint64_t ppn;
+    
+    ppn = get_gtd_ent(ssd->d_maptbl, vpn);
+    if (ppn == UNMAPPED_PPA) {
+        ftl_err("[trans_read] vpn: %lu,in nand_cache, but not in gtd\n", vpn);
+        return 0;
+    }
+
+    ppa = pgidx2ppa(ssd, ppn);
+    uint64_t lat = 0;
+    struct nand_cmd trd;
+    trd.type = USER_IO;
+    trd.cmd  = NAND_READ;
+    trd.stime = req->stime;
+    lat = ssd_advance_status(ssd, &ppa, &trd);
+
+    trans_lun = get_lun(ssd, &ppa);
+
+    return lat;
 }
 
 
-void gtd_add_segment(G_map_entry *gtd, Segment *seg, int *index) {
-    if (gtd->num_segments == 0) {
-        gtd->segments = (Segment *)malloc(1 * sizeof(Segment));
-        gtd->segments[0] = *seg;  // C语言结构浅拷贝,有可能出bug 
-        gtd->num_segments++; 
-        *index = 0;
-    } else {
-        gtd->segments = (Segment *)realloc(gtd->segments, (gtd->num_segments + 1) * sizeof(Segment));
-        // 二分查找插入位置,永远是右半区的最左边界
-        int32_t pos = dftl_binary_search(gtd, seg);
-        if (pos == gtd->num_segments - 1 && seg->x1 > gtd->segments[pos].x1) {
-            pos = gtd->num_segments;
-            *index = pos;
-            gtd->num_segments++;
-            gtd->segments[pos] = *seg;
-        } else {
-            *index = pos;
-            gtd->num_segments++;
-            for (int i = gtd->num_segments - 1; i >= pos + 1; i--) {
-                gtd->segments[i] = gtd->segments[i - 1];
+
+static uint64_t translation_page_write(struct ssd *ssd, uint64_t vpn) {
+    struct ppa new_ppa;
+    struct ppa old_ppa;
+    uint64_t old_ppn, new_ppn;
+    uint64_t lat = 0;
+
+    old_ppn = get_gtd_ent(ssd->d_maptbl, vpn);
+    if (old_ppn != UNMAPPED_PPA) {
+        old_ppa = pgidx2ppa(ssd, old_ppn);
+        mark_page_invalid(ssd, &old_ppa);
+        set_rmap_ent(ssd, INVALID_LPN, &old_ppa);
+    }
+    new_ppa = get_new_page(ssd, TRANS);
+    new_ppn = ppa2pgidx(ssd, &new_ppa);
+    set_gtd_ent(ssd->d_maptbl, vpn, new_ppn);
+    set_rmap_ent(ssd, vpn, &new_ppa);
+    mark_page_valid(ssd, &new_ppa);
+    ssd_advance_write_pointer(ssd, TRANS);
+
+    struct nand_cmd twr;
+    twr.type = USER_IO;
+    twr.cmd = NAND_WRITE;
+    twr.stime = 0;
+    lat = ssd_advance_status(ssd, &new_ppa, &twr);
+
+    return lat;
+}
+
+
+static inline uint64_t gc_translation_page_read(struct ssd *ssd, struct ppa *ppa)
+{
+    uint64_t lat = 0;
+    struct nand_cmd trd;
+    trd.type = GC_IO;
+    trd.cmd = NAND_READ;
+    trd.stime = 0;
+    lat = ssd_advance_status(ssd, ppa, &trd);
+    
+    return lat;
+}
+
+static uint64_t gc_translation_page_write(struct ssd *ssd, struct ppa *old_ppa)
+{
+    struct ppa new_ppa;
+    struct nand_lun *new_lun;
+    uint64_t vpn = get_rmap_ent(ssd, old_ppa);
+    uint64_t lat = 0;
+
+    if (mapped_ppa(old_ppa)) {
+        /* update old page information first */
+        mark_page_invalid(ssd, old_ppa);
+        set_rmap_ent(ssd, INVALID_LPN, old_ppa);
+    }
+    new_ppa = get_new_page(ssd, TRANS);
+
+
+    /* update maptbl */
+    uint64_t new_ppn;
+    new_ppn = ppa2pgidx(ssd, &new_ppa);
+    set_gtd_ent(ssd->d_maptbl, vpn, new_ppn);
+    /* update rmap */
+    set_rmap_ent(ssd, vpn, &new_ppa);
+
+    mark_page_valid(ssd, &new_ppa);
+    ssd_advance_write_pointer(ssd, TRANS);
+    /* need to advance the write pointer here */
+
+
+    struct nand_cmd twr;
+    twr.type = GC_IO;
+    twr.cmd = NAND_WRITE;
+    twr.stime = 0;
+    lat = ssd_advance_status(ssd, &new_ppa, &twr);
+
+    new_lun = get_lun(ssd, &new_ppa);
+    new_lun->gc_endtime = new_lun->next_lun_avail_time;
+
+    return lat;
+}
+
+
+
+static void gc_read_page(struct ssd *ssd, struct ppa *ppa)
+{
+    /* advance ssd status, we don't care about how long it takes */
+    if (ssd->sp.enable_gc_delay) {
+        struct nand_cmd gcr;
+        gcr.type = GC_IO;
+        gcr.cmd = NAND_READ;
+        gcr.stime = 0;
+        ssd_advance_status(ssd, ppa, &gcr);
+    }
+}
+
+/* move valid page data (already in DRAM) from victim line to a new page */
+static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
+{
+    struct ppa new_ppa;
+    struct nand_lun *new_lun;
+    uint64_t lpn = get_rmap_ent(ssd, old_ppa);
+
+    ftl_assert(valid_lpn(ssd, lpn));
+    new_ppa = get_new_page(ssd, DATA);
+
+
+    /* update maptbl */
+    set_maptbl_ent(ssd, lpn, &new_ppa);
+    /* update rmap */
+    set_rmap_ent(ssd, lpn, &new_ppa);
+
+
+    mark_page_valid(ssd, &new_ppa);
+    ssd_advance_write_pointer(ssd, DATA);
+
+    if (ssd->sp.enable_gc_delay) {
+        struct nand_cmd gcw;
+        gcw.type = GC_IO;
+        gcw.cmd = NAND_WRITE;
+        gcw.stime = 0;
+        ssd_advance_status(ssd, &new_ppa, &gcw);
+    }
+
+    new_lun = get_lun(ssd, &new_ppa);
+    new_lun->gc_endtime = new_lun->next_lun_avail_time;
+
+    return 0;
+}
+
+
+static struct line *select_victim_line(struct ssd *ssd, bool force)
+{
+    struct line_mgmt *lm = &ssd->lm;
+    struct line *victim_line = NULL;
+
+    victim_line = pqueue_peek(lm->victim_line_pq);
+    if (!victim_line) {
+        return NULL;
+    }
+
+    if (!force && victim_line->ipc < ssd->sp.pgs_per_line / 8) {
+        return NULL;
+    }
+
+    pqueue_pop(lm->victim_line_pq);
+    victim_line->pos = 0;
+    lm->victim_line_cnt--;
+
+    /* victim_line is a danggling node now */
+    return victim_line;
+}
+
+/* here ppa identifies the block we want to clean */
+static void clean_one_data_block(struct ssd *ssd, struct ppa *ppa)
+{
+    struct ssdparams *spp = &ssd->sp;
+    struct nand_page *pg_iter = NULL;
+    int cnt = 0;
+
+    uint64_t vpn2update[spp->pgs_per_blk];
+    int nums_vpn = 0, flag;
+
+    for (int pg = 0; pg < spp->pgs_per_blk; pg++) {
+        ppa->g.pg = pg;
+        pg_iter = get_pg(ssd, ppa);
+        /* there shouldn't be any free page in victim blocks */
+        ftl_assert(pg_iter->status != PG_FREE);
+
+        if (pg_iter->status == PG_VALID) {
+            uint64_t old_lpn, new_ppn, old_vpn;
+
+            gc_read_page(ssd, ppa);
+            /* delay the maptbl update until "write" happens */
+            old_lpn = get_rmap_ent(ssd, ppa);
+
+            gc_write_page(ssd, ppa);
+
+            new_ppn = ppa2pgidx(ssd, &ssd->maptbl[old_lpn]);
+
+            nand_cache_update(ssd->d_maptbl->nand_cache, old_lpn, new_ppn);
+            
+            old_vpn = old_lpn / ENTRY_PER_PAGE;
+            flag = 0;
+            for (int i = 0; i < nums_vpn; i++) {
+                if (vpn2update[i] == old_vpn) {
+                    flag = 1;
+                    break;
+                }
             }
-            gtd->segments[pos] = *seg;          
+            if (!flag) {
+                vpn2update[nums_vpn++] = old_vpn;
+                uint64_t trans_ppn = get_gtd_ent(ssd->d_maptbl, old_vpn);
+                if (trans_ppn == UNMAPPED_PPA)
+                    break;
+                struct ppa trans_ppa = pgidx2ppa(ssd, trans_ppn);
+                gc_translation_page_read(ssd, &trans_ppa);
+                gc_translation_page_write(ssd, &trans_ppa);
+            }
+
+            cnt++;
         }
     }
-    
-    // update Bitmap
-    uint32_t k = 0;
-    uint32_t i = seg->x1;
-    while (i <= seg->x2 && k < seg->filter.length) {
-        gtd->bitmap_filter.bitmap[i++] = seg->filter.bitmap[k++];
-    }  
+
+    ftl_assert(get_blk(ssd, ppa)->vpc == cnt);
 }
 
-void dftl_Segs_add_segment(Segs *segs, Segment *seg, int seg_id) {
-    if (segs->num_segments == 0) {
-        segs->segments = (Segment *)malloc(1 * sizeof(Segment));
-        segs->segments[0] = *seg;  
-        segs->segment_id[0] = seg_id; 
-        segs->num_segments++; 
-    } else {
-        segs->segments = (Segment *)realloc(segs->segments, (segs->num_segments + 1) * sizeof(Segment));
-        segs->segments[segs->num_segments] = *seg;
-        segs->segment_id[segs->num_segments] = seg_id;
-        segs->num_segments++;
+static void clean_one_trans_block(struct ssd *ssd, struct ppa *ppa){
+    struct ssdparams *spp = &ssd->sp;
+    struct nand_page *pg_iter = NULL;
+    int cnt = 0;
+
+    for (int pg = 0; pg < spp->pgs_per_blk; pg++) {
+        ppa->g.pg = pg;
+        pg_iter = get_pg(ssd, ppa);
+        /* there shouldn't be any free page in victim blocks */
+        ftl_assert(pg_iter->status != PG_FREE);
+        if (pg_iter->status == PG_VALID) {
+            gc_translation_page_read(ssd, ppa);
+            gc_translation_page_write(ssd, ppa);
+
+            cnt++;
+        }
     }
+
+    ftl_assert(get_blk(ssd, ppa)->vpc == cnt);    
 }
 
-void gtd_del_segment(G_map_entry *gtd, int pos) {
-    if (pos < 0 || pos >= gtd->num_segments) {
-        femu_log("删除位置不对\n");
-        return ;
-    }
-    for (int i = pos; i < gtd->num_segments - 1; i++) {
-        gtd->segments[i] = gtd->segments[i + 1];
-    }
-    gtd->num_segments--;
-    gtd->segments = (Segment *)realloc(gtd->segments, gtd->num_segments * sizeof(Segment));
-
-    if (gtd->num_segments == 0) {
-        free(gtd->segments);
-        gtd->segments = NULL;
-    }
+static void mark_line_free(struct ssd *ssd, struct ppa *ppa)
+{
+    struct line_mgmt *lm = &ssd->lm;
+    struct line *line = get_line(ssd, ppa);
+    line->ipc = 0;
+    line->vpc = 0;
+    /* move this line to free line list */
+    QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
+    lm->free_line_cnt++;
 }
 
-void gtd_add_segments(G_map_entry *gtd, Segment *segments, int num_segments) {
+static int do_gc(struct ssd *ssd, bool force)
+{
+   // femu_log("GC_begin, force: %s\n", force ? "true" : "false");
+    struct line *victim_line = NULL;
+    struct ssdparams *spp = &ssd->sp;
+    struct nand_lun *lunp;
+    struct ppa ppa;
+    int ch, lun;
 
-    for (int i = 0; i < num_segments; i++) {
-        int index = 0;
+    victim_line = select_victim_line(ssd, force);
 
-        if (gtd->num_segments == 0) {
-            gtd_add_segment(gtd, &segments[i], &index);
+
+    // debug
+    // if (victim_line->type == TRANS) {
+    //     return 0;
+    // }
+
+
+    if (!victim_line) {
+       // femu_log("no victime_line\n");
+        return -1;
+    }
+
+    ppa.g.blk = victim_line->id;
+
+    femu_log("GC选取超级块id:%d, GC类型: %s, vim_line_vpc: %d, vim_line_ipc: %d\n", victim_line->id, victim_line->type == TRANS ? "TRANS" : "DATA",
+                victim_line->vpc, victim_line->ipc);
+
+
+    ftl_debug("GC-ing line:%d,ipc=%d,victim=%d,full=%d,free=%d\n", ppa.g.blk,
+              victim_line->ipc, ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt,
+              ssd->lm.free_line_cnt);
+
+    /* copy back valid data */
+    // superblok level clean block
+    for (ch = 0; ch < spp->nchs; ch++) {
+        for (lun = 0; lun < spp->luns_per_ch; lun++) {
+            ppa.g.ch = ch;
+            ppa.g.lun = lun;
+            ppa.g.pl = 0;
+            lunp = get_lun(ssd, &ppa);
+            if (victim_line->type == DATA) {
+                ssd->d_maptbl->counter.gc_data_cnt++;
+                clean_one_data_block(ssd, &ppa);
+            } else {
+                ssd->d_maptbl->counter.gc_trans_cnt++;
+                clean_one_trans_block(ssd, &ppa);
+            }
+            mark_block_free(ssd, &ppa);
+
+            if (spp->enable_gc_delay) {
+                struct nand_cmd gce;
+                gce.type = GC_IO;
+                gce.cmd = NAND_ERASE;
+                gce.stime = 0;
+                ssd_advance_status(ssd, &ppa, &gce);
+            }
+
+            lunp->gc_endtime = lunp->next_lun_avail_time;
+        }
+    }
+
+    /* update line status */
+    mark_line_free(ssd, &ppa);
+    femu_log("GC_end\n");
+    return 0;
+}
+
+
+
+static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
+{
+    struct ssdparams *spp = &ssd->sp;
+    uint64_t lba = req->slba;
+    int nsecs = req->nlb;
+    struct ppa ppa;
+    uint64_t start_lpn = lba / spp->secs_per_pg;
+    uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_pg;
+    uint64_t lpn;
+    uint64_t sublat = 0, maxlat = 0;
+    uint64_t ret_ppn;
+    uint64_t maptbl_lat = 0;
+    struct nand_lun *trans_lun = NULL;
+
+    if (end_lpn >= spp->tt_pgs) {
+        ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
+    }
+
+    /* normal IO read path */
+    for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        ssd->d_maptbl->counter.group_read_cnt++;
+        femu_log("[read]: lpn:%lu\n", lpn);
+        ret_ppn = dftl_get(ssd->d_maptbl, lpn, &maptbl_lat, ssd, req, trans_lun);
+        if (ret_ppn == UNMAPPED_PPA) {
+            ssd->d_maptbl->counter.group_read_miss++;
             continue;
         }
-        Segs overlap_segs;
-        overlap_segs.num_segments = 0;
-        overlap_segs.segments = NULL;
-        memset(overlap_segs.segment_id, 0, Write_Buffer_Entries * sizeof(int));
-
-        gtd_add_segment(gtd, &segments[i], &index);
-        if (index != 0) {
-            if (gtd->segments[index].x1 <= gtd->segments[index - 1].x2) {
-                dftl_Segs_add_segment(&overlap_segs, &gtd->segments[index - 1], index - 1);
-            }
+        else if (!valid_lpn(ssd, ret_ppn)) {
+            femu_log("Invalid ppA: %lu\n", ret_ppn);
+            continue;
         }
-        for (int j = index + 1; j < gtd->num_segments; j++) {
-            if (gtd->segments[j].x1 > segments[i].x2) {
-                break;
-            }
-            dftl_Segs_add_segment(&overlap_segs, &gtd->segments[j], j);            
+        assert(ret_ppn != UNMAPPED_PPA);
+        ppa = pgidx2ppa(ssd, ret_ppn);
+
+        struct nand_lun *data_lun;
+        data_lun = get_lun(ssd, &ppa);
+        data_lun->next_lun_avail_time = (trans_lun->next_lun_avail_time > data_lun->next_lun_avail_time) ? \
+                                         trans_lun->next_lun_avail_time : data_lun->next_lun_avail_time;
+
+
+        struct nand_cmd srd;
+        srd.type = USER_IO;
+        srd.cmd = NAND_READ;
+        srd.stime = req->stime;
+        sublat = ssd_advance_status(ssd, &ppa, &srd);
+        maxlat = (sublat > maxlat) ? sublat : maxlat;
+    }
+
+    return maxlat;
+}
+
+static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
+{
+    uint64_t lba = req->slba;
+    struct ssdparams *spp = &ssd->sp;
+    int len = req->nlb;
+    uint64_t start_lpn = lba / spp->secs_per_pg;
+    uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
+    struct ppa ppa;
+    uint64_t lpn;
+    uint64_t curlat = 0, maxlat = 0, w_translat = 0;
+    int r;
+
+    if (end_lpn >= spp->tt_pgs) {
+        ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
+    }
+
+    while (should_gc_high(ssd)) {  //
+        /* perform GC here until !should_gc(ssd) */ // front
+        r = do_gc(ssd, true);
+        if (r == -1)
+            break;
+    }
+
+    for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        if (ssd->d_maptbl->counter.has_tbl[lpn] == 0) {
+            ssd->d_maptbl->counter.has_tbl[lpn] = 1;
+            ssd->d_maptbl->counter.group_write_cnt++;
+            if (ssd->d_maptbl->counter.write_maxLBA < lpn) ssd->d_maptbl->counter.write_maxLBA = lpn;
+            if (ssd->d_maptbl->counter.write_minLBA > lpn) ssd->d_maptbl->counter.write_minLBA = lpn;
+        }
+
+        //femu_log("[write]: lpn:%lu\n", lpn);
+
+        w_translat = 0;
+        ppa = get_maptbl_ent(ssd, lpn);
+        if (mapped_ppa(&ppa)) {
+            /* update old page information first */
+            mark_page_invalid(ssd, &ppa);
+            set_rmap_ent(ssd, INVALID_LPN, &ppa);
         }
         
+        /* new write */
+        ppa = get_new_page(ssd, DATA);
+        uint64_t ppn = ppa2pgidx(ssd, &ppa);
+        dftl_put(ssd->d_maptbl, lpn, ppn, ssd, &w_translat);
+        /* update maptbl */
+        set_maptbl_ent(ssd, lpn, &ppa);
+        /* update rmap */
+        set_rmap_ent(ssd, lpn, &ppa);
+        mark_page_valid(ssd, &ppa);
+        ssd_advance_write_pointer(ssd, DATA);
 
-        uint32_t indices_to_delete[1024];
-        int      indect_pointer = 0;
 
-        for (int j = 0; j < overlap_segs.num_segments; j++) {
-            int same_level = 0;
-            dftl_Segment_merge(&segments[i], &overlap_segs.segments[j], &same_level);
+        struct nand_cmd swr;
+        swr.type = USER_IO;
+        swr.cmd = NAND_WRITE;
+        swr.stime = req->stime;
+        /* get latency statistics */
+        curlat = ssd_advance_status(ssd, &ppa, &swr);
+        curlat = (curlat > w_translat) ? curlat : w_translat;
+        maxlat = (curlat > maxlat) ? curlat : maxlat;
+    }
 
-            if (same_level == -1) {
-                indices_to_delete[indect_pointer++] = overlap_segs.segment_id[j]; 
-            } else if (same_level == 0) {
-                //TODO               
-            } else if (same_level == 1) {
-                // 合并后不重叠
-                int pos = overlap_segs.segment_id[j];
-                gtd->segments[pos] = overlap_segs.segments[j];
+    return maxlat;
+}
+
+__attribute__((optimize("O0")))
+static void *ftl_thread(void *arg)
+{
+    FemuCtrl *n = (FemuCtrl *)arg;
+    struct ssd *ssd = n->ssd;
+    NvmeRequest *req = NULL;
+    uint64_t lat = 0;
+    int rc;
+    int i;
+
+    while (!*(ssd->dataplane_started_ptr)) {
+        usleep(100000);
+    }
+
+    /* FIXME: not safe, to handle ->to_ftl and ->to_poller gracefully */
+    ssd->to_ftl = n->to_ftl;
+    ssd->to_poller = n->to_poller;
+
+    while (1) {
+        for (i = 1; i <= n->num_poller; i++) {
+            if (!ssd->to_ftl[i] || !femu_ring_count(ssd->to_ftl[i]))
+                continue;
+
+            rc = femu_ring_dequeue(ssd->to_ftl[i], (void *)&req, 1);
+            if (rc != 1) {
+                printf("FEMU: FTL to_ftl dequeue failed\n");
             }
 
-        }
-    
-        if (overlap_segs.segments != NULL) {
-            free(overlap_segs.segments);
-            overlap_segs.num_segments = 0;
-            overlap_segs.segments = NULL;
-        }
+            ftl_assert(req);
+            switch (req->cmd.opcode) {
+            case NVME_CMD_WRITE:
+                if (ssd->pass)
+                    lat = ssd_write(ssd, req);
+                break;
+            case NVME_CMD_READ:
+                // if (ssd->pass)
+                    // lat = ssd_read(ssd, req);
+                break;
+            case NVME_CMD_DSM:
+                lat = 0;
+                break;
+            default:
+                ftl_err("FTL received unkown request type, ERROR\n");
+            }
 
-        for (int j = indect_pointer - 1; j >= 0; j--) {
-            gtd_del_segment(gtd, indices_to_delete[j]);
-        }
+            req->reqlat = lat;
+            req->expire_time += lat;
 
+            rc = femu_ring_enqueue(ssd->to_poller[i], (void *)&req, 1);
+            if (rc != 1) {
+                ftl_err("FTL to_poller enqueue failed\n");
+            }
+
+            /* clean one line if needed (in the background) */
+            if (should_gc(ssd)) {
+                do_gc(ssd, false);
+            }
+        }
     }
-    return ;
-}
 
-void gtd_entry_init(G_map_entry *gtd, uint64_t page_idx) {
-    gtd->page_idx = page_idx;
-    gtd->ppa      = UNMAPPED_PPA;
-    
-    // 精确段 误差0
-    dftl_plr_init(&gtd->plr, PLR_Error_bound);
-
-    gtd->bitmap_filter.length = ENTRY_PER_PAGE + 1;
-    gtd->bitmap_filter.bitmap = (unsigned char *)malloc(gtd->bitmap_filter.length * sizeof(unsigned char));
-    memset(gtd->bitmap_filter.bitmap, 0, gtd->bitmap_filter.length * sizeof(unsigned char));
-
-    gtd->num_segments = 0;
-    gtd->segments = NULL;
-}
-
-
-void dftl_print_gtd(G_map_entry *gtd) {
-    for (int i = 0; i < gtd->num_segments; i++) {
-        Segment seg = gtd->segments[i];
-        femu_log("[gtd_Segment %d]: k: %.2f, b: %.2f, x1: %u, x2: %u, %s, %s\n", i,
-                seg.k, seg.b, seg.x1, seg.x2, seg.accurate ? "精确":"不精确", seg.consecutive ? "连续":"不连续");
-    }
+    return NULL;
 }
 
 void dftl_static(DFTLTable *d_maptbl) {
-    femu_log("[DFTL]write_cnt:%d, read_cnt: %d, read_miss: %d, cmt_hit: %d, double_read: %d, evit_cnt: %d\n",
+    femu_log("[DFTL]write_cnt:%d, read_cnt: %d, read_miss: %d, cmt_hit: %d, cmt_miss: %d, evit_cnt: %d, gc_data_cnt: %d, gc_trans_cnt:%d\n", 
     d_maptbl->counter.group_write_cnt, d_maptbl->counter.group_read_cnt,
     d_maptbl->counter.group_read_miss, d_maptbl->counter.group_cmt_hit,
-    d_maptbl->counter.group_double_read, d_maptbl->counter.evit_cnt);
+    d_maptbl->counter.group_cmt_miss, d_maptbl->counter.evit_cnt,
+    d_maptbl->counter.gc_data_cnt, d_maptbl->counter.gc_trans_cnt);
+
     femu_log("[DFTL]cache_cnt: %lu/%lu, nand_cnt: %lu/%lu\n", d_maptbl->CMT->count, d_maptbl->CMT->capacity, 
     d_maptbl->nand_cache->count, d_maptbl->nand_cache->capacity);
-}
-
-
-void o_static(struct ssd* ssd) {
-    return ;
 }

@@ -1,5 +1,5 @@
 #include "../nvme.h"
-#include "./ftl.h"
+#include "./dftl.h"
 
 static void bb_init_ctrl_str(FemuCtrl *n)
 {
@@ -66,25 +66,27 @@ static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
         femu_log("%s,Log print [Disabled]!\n", n->devname);
         break;
     case FEMU_ENABLE_LEAFTL_IO:
-        ssd->io_interface = LEAFTL_IO;
         femu_log("%s,LeaFTL_IO [enabled]!\n", n->devname);
         break;
     case FEMU_ENABLE_DFTL_IO:
-        ssd->io_interface = DFTL_IO;
+        ssd->pass = 1;
+        femu_log("pass_cnt: %d\n", ssd->pass);
         femu_log("%s,DFTL_IO [enabled]!\n", n->devname);
-        break;   
+        break;
+    case FEMU_ENABLE_LEAEDFTL_IO:
+        femu_log("%s,LEAEDFTL_IO [enabled]!\n", n->devname);
+        break; 
+    case FEMU_ENABLE_NOMAL_IO:
+        femu_log("%s,NOMAL_IO [enabled]!\n", n->devname);
+        break; 
     case FEMU_Group_Static:
-        FrameGroup_static(&ssd->l_maptbl);
-        // FrameGroup_init(&ssd->l_maptbl, error_bound);
-        // FrameGroup_static(&ssd->l_maptbl);
-        // for (int i = 0; i < WB_Entries + 2; i++) {
-        //         ssd->WB[i].LPA = 0;
-        //         ssd->WB[i].PPA = 0;
-        //     }
-        // ssd->num_write_entries = 0;  
+       // FrameGroup_static(&ssd->l_maptbl);
         break;   
     case FEMU_DFTL_Static:
         dftl_static(ssd->d_maptbl);
+        // dftl_static(ssd);
+        femu_log("%s,static [enabled]!\n", n->devname);
+        // l_static(ssd);
         break;
     default:
         printf("FEMU:%s,Not implemented flip cmd (%lu)\n", n->devname, cdw10);
