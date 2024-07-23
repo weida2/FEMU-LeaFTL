@@ -1,5 +1,5 @@
 #include "../nvme.h"
-#include "./dftl.h"
+#include "./ftl.h"
 
 static void bb_init_ctrl_str(FemuCtrl *n)
 {
@@ -83,8 +83,8 @@ static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
        // FrameGroup_static(&ssd->l_maptbl);
         break;   
     case FEMU_DFTL_Static:
-        dftl_static(ssd->d_maptbl);
-        // dftl_static(ssd);
+       // dftl_static(ssd->d_maptbl);
+        dftl_static(ssd);
         femu_log("%s,static [enabled]!\n", n->devname);
         // l_static(ssd);
         break;

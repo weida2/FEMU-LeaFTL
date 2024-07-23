@@ -460,6 +460,7 @@ void ssd_init(FemuCtrl *n)
     
     
     ssd->pass = 0;
+    ssd->counter.read_cnt = 0;
 
     /* initialize ssd internal layout architecture */
     ssd->ch = g_malloc0(sizeof(struct ssd_channel) * spp->nchs);
@@ -883,6 +884,7 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        ssd->counter.read_cnt++;
         ppa = get_maptbl_ent(ssd, lpn); // ssd->maptbl[lpn]
         if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
             //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
@@ -993,8 +995,7 @@ static void *ftl_thread(void *arg)
                     lat = ssd_write(ssd, req);
                 break;
             case NVME_CMD_READ:
-                // if (ssd->pass)
-                    // lat = ssd_read(ssd, req);
+                    lat = ssd_read(ssd, req);
                 break;
             case NVME_CMD_DSM:
                 lat = 0;
@@ -1022,3 +1023,7 @@ static void *ftl_thread(void *arg)
     return NULL;
 }
 
+void dftl_static(struct ssd* ssd) {
+    femu_log("[FTL]read_cnt: %d\n",
+                ssd->counter.read_cnt);
+}

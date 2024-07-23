@@ -226,6 +226,11 @@ typedef struct Write_Buffer {
     uint32_t PPA;
 } Write_Buffer;
 
+typedef struct Cnt {
+    int read_cnt;
+
+}Cnt;
+
 struct ssd {
     char *ssdname;
     struct ssdparams sp;
@@ -236,6 +241,8 @@ struct ssd {
     struct line_mgmt lm;
 
     int pass;
+    struct Cnt counter;
+
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;
     struct rte_ring **to_poller;

@@ -1657,12 +1657,12 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         }
         assert(ret_ppn != UNMAPPED_PPA);
         ppa = pgidx2ppa(ssd, ret_ppn);
-
-        struct nand_lun *data_lun;
-        data_lun = get_lun(ssd, &ppa);
-        data_lun->next_lun_avail_time = (trans_lun->next_lun_avail_time > data_lun->next_lun_avail_time) ? \
-                                         trans_lun->next_lun_avail_time : data_lun->next_lun_avail_time;
-
+        if (trans_lun != NULL) {
+            struct nand_lun *data_lun;
+            data_lun = get_lun(ssd, &ppa);
+            data_lun->next_lun_avail_time = (trans_lun->next_lun_avail_time > data_lun->next_lun_avail_time) ? \
+                                            trans_lun->next_lun_avail_time : data_lun->next_lun_avail_time;
+        }
 
         struct nand_cmd srd;
         srd.type = USER_IO;
