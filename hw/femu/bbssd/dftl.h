@@ -7,7 +7,7 @@
 #define UNMAPPED_PPA    (~(0ULL))
 
 #define ENTRY_PER_PAGE  (1024) // 4KB / 4B = 1024
-#define CMT_ratio       1/8     // 4MB
+#define CMT_ratio       1/64     // 1/2MB
 
 #define BLK_BITS    (16)
 #define PG_BITS     (16)
@@ -266,6 +266,10 @@ typedef struct Cnt {
     int gc_data_cnt;
     int gc_trans_cnt;
 
+    // request_cnt
+    int req_dely;
+    int req_nodely;
+
 }Cnt;
 
 
@@ -278,11 +282,26 @@ typedef struct G_map_entry {
 
 } G_map_entry;
 
+typedef struct Node_entry {
+    uint64_t node_idx;
+    struct nand_lun* rely_lun;
+    uint64_t lun_end_time;
+    
+    QTAILQ_HEAD(rely_req_list, NvmeRequest) rely_req_list;
+    int tag;
+    int num_req;
+
+} Node_entry;
+
+
+
 typedef struct DFTLTable {
     LRUCache *CMT;    
     LRUCache *nand_cache; 
 
     G_map_entry *GTD;
+    
+    Node_entry* nodeTag;
     
     struct Cnt counter;    
 } DFTLTable;
@@ -304,7 +323,6 @@ struct ssd {
     // dftl.struct
     DFTLTable* d_maptbl;
     struct write_pointer  t_wp;  // translation block wp;
-    struct line_mgmt      t_lm; 
 
     int pass;
 

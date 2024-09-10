@@ -1,7 +1,7 @@
 #include "dftl.h"
 static void *ftl_thread(void *arg);
 static uint64_t translation_page_write(struct ssd *ssd, uint64_t vpn);
-static uint64_t translation_page_read(struct ssd *ssd, uint64_t vpn, NvmeRequest *req, struct nand_lun *trans_lun);
+static uint64_t translation_page_read(struct ssd *ssd, uint64_t vpn, NvmeRequest *req, struct nand_lun **trans_lun);
 
 uint64_t dftl_evict(DFTLTable *d_maptbl, LRUCache *cache, LRUCache* nand_cache, uint64_t *lat, struct ssd* ssd);
 uint64_t addNodeToNandCache(LRUCache *nand_cache, Node *node);
@@ -422,8 +422,8 @@ uint64_t dftl_evict(DFTLTable *d_maptbl, LRUCache *cache, LRUCache* nand_cache, 
 }
 
 
-// 从 flash移出node应该保留
-uint64_t move_node_from_nand_to_cache(DFTLTable *d_maptbl, LRUCache *cache, LRUCache *nand_cache, uint64_t key, uint64_t* lat, NvmeRequest *req, struct nand_lun *trans_lun, struct ssd *ssd) {
+// 从 flash移出node应该保留 读映射表该页的lun的延迟模拟
+uint64_t move_node_from_nand_to_cache(DFTLTable *d_maptbl, LRUCache *cache, LRUCache *nand_cache, uint64_t key, uint64_t* lat, NvmeRequest *req, struct nand_lun **trans_lun, struct ssd *ssd) {
     uint64_t page_idx = key / ENTRY_PER_PAGE;
     uint64_t has_index = hash(page_idx, nand_cache->capacity);
     
@@ -442,36 +442,18 @@ uint64_t move_node_from_nand_to_cache(DFTLTable *d_maptbl, LRUCache *cache, LRUC
         return UNMAPPED_PPA;
     }
 
-    // update has_linklist one-dir
-    // if (pre == NULL) {
-    //     nand_cache->hashTable[has_index] = nand_cache->hashTable[has_index]->hash_next;
-    // } else {
-    //     pre->hash_next = cur->hash_next;
-    // }
-
-    // // upate LRU_linklist two-dir
-    // if (nand_cache->head == cur) {
-    //     nand_cache->head = cur->next;
-    // }
-    // if (nand_cache->tail == cur) {
-    //     nand_cache->tail = cur->pre;
-    // }
-
-    // if (cur->pre != NULL) {
-    //     cur->pre->next = cur->next;
-    // }
-    // if (cur->next != NULL) {
-    //     cur->next->pre = cur->pre;
-    // }
 
     uint64_t evict_key = UNMAPPED_PPA;
     bool evict_happen = false;
    // (*lat) += NAND_READ_LATENCY;   
     cur->update_in_flash = false; 
 
-    (*lat) += translation_page_read(ssd, page_idx, req, trans_lun);
-    
+    uint64_t trans_lat = translation_page_read(ssd, page_idx, req, trans_lun);
+    if (trans_lat == 0) {
+        return UNMAPPED_PPA;
+    }
 
+    (*lat) += trans_lat;
     addNodeToCache(d_maptbl, cache, nand_cache, cur, &evict_happen, &evict_key, lat, ssd);
 
     // uint64_t bmp_idx = cur->page_idx / 8;
@@ -495,6 +477,16 @@ void set_gtd_ent(DFTLTable *d_tbl, uint64_t vpn, uint64_t ppn) {
     d_tbl->GTD[vpn].ppn = ppn;
 }
 
+void node_entry_init(Node_entry *node_entry) {
+    node_entry->lun_end_time = 0;
+    node_entry->rely_lun = NULL;
+
+    QTAILQ_INIT(&node_entry->rely_req_list);
+    node_entry->num_req = 0;
+
+    node_entry->tag = 1;
+}
+
 DFTLTable* dftl_table_init(uint32_t tt_pages) {
     DFTLTable *table = (DFTLTable *)malloc(sizeof(DFTLTable));
     assert(table != NULL);
@@ -509,6 +501,13 @@ DFTLTable* dftl_table_init(uint32_t tt_pages) {
         gtd_entry_init(&table->GTD[i]);
     }
 
+    table->nodeTag = (Node_entry *)malloc(sizeof(Node_entry) * total_vpn);
+    for (uint64_t i = 0; i < total_vpn; i++) {
+        table->nodeTag[i].node_idx = i;
+        node_entry_init(&table->nodeTag[i]);
+    }
+
+
     table->nand_cache = createLRUCache(total_vpn, bmp_cnt);
 
     table->counter.group_write_cnt   = 0;
@@ -519,6 +518,9 @@ DFTLTable* dftl_table_init(uint32_t tt_pages) {
     table->counter.evit_cnt          = 0;
     table->counter.gc_data_cnt       = 0;
     table->counter.gc_trans_cnt       = 0;
+
+    table->counter.req_dely          = 0;
+    table->counter.req_nodely        = 0;
     
     table->counter.has_tbl = g_malloc0(sizeof(uint64_t) * tt_pages);
     for (int i = 0; i < tt_pages; i++) {
@@ -530,30 +532,104 @@ DFTLTable* dftl_table_init(uint32_t tt_pages) {
     return table;
 }
 
-uint64_t dftl_get(DFTLTable *table, uint64_t lpn ,uint64_t* lat, struct ssd* ssd, NvmeRequest *req, struct nand_lun *trans_lun) {
+void dftl_check(DFTLTable *table, uint64_t lpn ,uint64_t* lat, struct ssd* ssd, NvmeRequest *req, struct nand_lun **trans_lun) {
     uint64_t page_idx = lpn / ENTRY_PER_PAGE;
     uint64_t bmp_idx = page_idx / 8;
     uint8_t  bit_idx = page_idx % 8;
 
+    // 要读的页不在CMT上 此时需要将该页映射表读出来 
+    //！同时进行延迟模拟推进，以及后续同读该页的请求[缓存]
+    if (!map_check_bit(&(table->CMT->flash_bmp[bmp_idx]), bit_idx)) {
+        uint64_t evit_page_idx = move_node_from_nand_to_cache(table, table->CMT, table->nand_cache, lpn, lat, req, trans_lun, ssd);
+        if (evit_page_idx == UNMAPPED_PPA || trans_lun == NULL) {
+            return ;
+        }
+        struct nand_lun *tmp_lun = *trans_lun;
+        table->nodeTag[page_idx].rely_lun = tmp_lun;
+        table->nodeTag[page_idx].lun_end_time = tmp_lun->next_lun_avail_time;
+
+        req->stag = ReqCache;   // 延迟
+        req->expire_time_start = (req->expire_time_start < tmp_lun->next_lun_avail_time) ? \
+                                 tmp_lun->next_lun_avail_time : req->expire_time_start;
+
+        // QTAILQ_INSERT_TAIL(&table->nodeTag[page_idx].rely_req_list, req, entry);
+        table->nodeTag[page_idx].num_req++;
+        table->nodeTag[page_idx].tag = 2;  
+
+        table->counter.group_cmt_miss++;
+        table->counter.req_dely++;
+    } else if (table->nodeTag[page_idx].tag == 2 && req->stime < table->nodeTag[page_idx].lun_end_time) {
+        req->stag = ReqCache;
+        req->expire_time_start = (req->expire_time_start < table->nodeTag[page_idx].lun_end_time) ? \
+                                 table->nodeTag[page_idx].lun_end_time : req->expire_time_start;
+
+        // QTAILQ_INSERT_TAIL(&table->nodeTag[page_idx].rely_req_list, req, entry);
+        table->nodeTag[page_idx].num_req++;
+
+        table->counter.group_cmt_miss++;
+        table->counter.req_dely++;
+    } else {
+        table->counter.group_cmt_hit++;
+        table->counter.req_nodely++;
+    }
+
+    return ;
+}
+
+void dftl_read(DFTLTable *table, uint64_t lpn ,uint64_t* lat, struct ssd* ssd, NvmeRequest *req, uint64_t now) { 
+    uint64_t page_idx = lpn / ENTRY_PER_PAGE;
+
+    //CMT LRU
+    LRUCache *cache = ssd->d_maptbl->CMT;
+    uint64_t index = hash(page_idx, cache->capacity);
+    Node *cur = cache->hashTable[index];
+    while (cur != NULL) {
+        if (cur->page_idx == page_idx) {
+            moveToFront(cache, cur);
+            // return cur->l2p_entries[key % ENTRY_PER_PAGE];  // ppa = l2p[oft]
+        }
+        cur = cur->hash_next;
+    }
+    // (ret_ppn = cur->l2p_entries[key % ENTRY_PER_PAGE]) != ppa   //脏读
+
+    //更新CMT中Node的信息 
+    if (ssd->d_maptbl->nodeTag[page_idx].tag == 2 && now >= ssd->d_maptbl->nodeTag[page_idx].lun_end_time) {
+        ssd->d_maptbl->nodeTag[page_idx].num_req--;
+        if (ssd->d_maptbl->nodeTag[page_idx].num_req == 0) {
+            ssd->d_maptbl->nodeTag[page_idx].tag = 1;
+        }
+    }
+
+    return ;
+}
+
+
+uint64_t dftl_get(DFTLTable *table, uint64_t lpn ,uint64_t* lat, struct ssd* ssd, NvmeRequest *req, struct nand_lun **trans_lun) {
+    uint64_t page_idx = lpn / ENTRY_PER_PAGE;
+    uint64_t bmp_idx = page_idx / 8;
+    uint8_t  bit_idx = page_idx % 8;
+    uint64_t ppa = UNMAPPED_PPA;
+
+    // 要读的页不在CMT上 此时需要将该页映射表读出来 
+    //！同时进行延迟模拟推进，以及后续同读该页的请求[缓存]
     if (!map_check_bit(&(table->CMT->flash_bmp[bmp_idx]), bit_idx)) {
         uint64_t evit_page_idx = move_node_from_nand_to_cache(table, table->CMT, table->nand_cache, lpn, lat, req, trans_lun, ssd);
         if (evit_page_idx == UNMAPPED_PPA) {
             return evit_page_idx;
         }
-        table->counter.group_cmt_miss++;
-    } else {
-        table->counter.group_cmt_hit++;
+    }    
+    else {
+        uint64_t ppa = lru_get(table, table->CMT, lpn, ssd);
+        // femu_log("[dftl_get] lpa: %lu, page_idx: %lu, ret_ppa:%ld\n", lpa, page_idx, ppa == UNMAPPED_PPA ? -1 : ppa);
+        
+        // 一个问题 (1k读粒度导致) (读放大)
+        // 如果此时ppa == UNMAP说明 读的该lpa所在页号page_idx是存在，但是对应的lpa不存在(访问不存在的lpa)，粗粒度读缺失，造成多余的闪存访问延迟
+
     }
-
-    u_int64_t ppa = lru_get(table, table->CMT, lpn, ssd);
-    // femu_log("[dftl_get] lpa: %lu, page_idx: %lu, ret_ppa:%ld\n", lpa, page_idx, ppa == UNMAPPED_PPA ? -1 : ppa);
-    
-    // 一个问题 (1k读粒度导致) (读放大)
-    // 如果此时ppa == UNMAP说明 读的该lpa所在页号page_idx是存在，但是对应的lpa不存在(访问不存在的lpa)，粗粒度读缺失，造成多余的闪存访问延迟
-
     return ppa;
-
 }
+
+
 void dftl_put(DFTLTable* table, uint64_t lpn, uint64_t ppn, struct ssd *ssd, uint64_t *lat) {
     lru_put(table, table->CMT, table->nand_cache, lpn, ppn, ssd, lat);
     return ;
@@ -1292,13 +1368,13 @@ static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
 * @brief translation_page method (Normal & GC)
 *
 */
-static uint64_t translation_page_read(struct ssd *ssd, uint64_t vpn, NvmeRequest *req, struct nand_lun *trans_lun) {
+static uint64_t translation_page_read(struct ssd *ssd, uint64_t vpn, NvmeRequest *req, struct nand_lun **trans_lun) {
     struct ppa ppa;
     uint64_t ppn;
     
     ppn = get_gtd_ent(ssd->d_maptbl, vpn);
     if (ppn == UNMAPPED_PPA) {
-        ftl_err("[trans_read] vpn: %lu,in nand_cache, but not in gtd\n", vpn);
+        femu_log("[trans_read] vpn: %lu,in nand_cache, but not in gtd\n", vpn);
         return 0;
     }
 
@@ -1310,8 +1386,9 @@ static uint64_t translation_page_read(struct ssd *ssd, uint64_t vpn, NvmeRequest
     trd.stime = req->stime;
     lat = ssd_advance_status(ssd, &ppa, &trd);
 
-    trans_lun = get_lun(ssd, &ppa);
-
+    *trans_lun = get_lun(ssd, &ppa);
+    femu_log("[tr_pages_read] vpn: %lu -> ppn: %lu, trans_lun->time: %lu\n", vpn, ppn, (*trans_lun)->next_lun_avail_time);
+    
     return lat;
 }
 
@@ -1624,7 +1701,7 @@ static int do_gc(struct ssd *ssd, bool force)
 
 
 
-static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
+static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req, FemuCtrl *n)
 {
     struct ssdparams *spp = &ssd->sp;
     uint64_t lba = req->slba;
@@ -1634,19 +1711,63 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
     uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_pg;
     uint64_t lpn;
     uint64_t sublat = 0, maxlat = 0;
+
     uint64_t ret_ppn;
     uint64_t maptbl_lat = 0;
     struct nand_lun *trans_lun = NULL;
+    pqueue_t *pq = n->req_list;
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME); 
 
     if (end_lpn >= spp->tt_pgs) {
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
+    femu_log("[ssd_read]: req_id: %d, req_stag: %d\n", req->id, req->stag);
+
+    // resend check
+    if (req->stag == ReqResend) {
+         for (lpn = start_lpn; lpn <= end_lpn; lpn += ENTRY_PER_PAGE) {
+
+            dftl_read(ssd->d_maptbl, lpn, &maptbl_lat, ssd, req, now);
+
+            for (uint64_t atom_lpn = lpn; atom_lpn <= end_lpn; atom_lpn++) {
+                ssd->d_maptbl->counter.group_read_cnt++;
+
+                ppa = get_maptbl_ent(ssd, lpn);
+                if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
+                    ssd->d_maptbl->counter.group_read_miss++;
+                    continue;
+                }
+
+                struct nand_cmd srd;
+                srd.type = USER_IO;
+                srd.cmd = NAND_READ;
+                srd.stime = req->stime;
+                sublat = ssd_advance_status(ssd, &ppa, &srd);
+                maxlat = (sublat > maxlat) ? sublat : maxlat;    
+            }      
+        }
+        goto ed;       
+    }
+
+    // check
+    if (req->stag == ReqInitial) {
+        for (lpn = start_lpn; lpn <= end_lpn; lpn += ENTRY_PER_PAGE) {
+            femu_log("[dftl_check_in]\n");
+            dftl_check(ssd->d_maptbl, lpn, &maptbl_lat, ssd, req, &trans_lun);
+            femu_log("[dftl_check_out] req_id: %d, req_stag: %d, req_slpn: %lu, req_ex_start: %lu\n", 
+                    req->id, req->stag, start_lpn, req->expire_time_start);
+        }
+        if (req->stag == ReqCache) {
+            pqueue_insert(pq, req);
+            femu_log("[pq_insert]: 插入成功, pq_nums: %lu\n", pqueue_size(pq));
+            goto ed;
+        }
+    } 
 
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         ssd->d_maptbl->counter.group_read_cnt++;
-        femu_log("[read]: lpn:%lu\n", lpn);
-        ret_ppn = dftl_get(ssd->d_maptbl, lpn, &maptbl_lat, ssd, req, trans_lun);
+        ret_ppn = dftl_get(ssd->d_maptbl, lpn, &maptbl_lat, ssd, req, &trans_lun);
         if (ret_ppn == UNMAPPED_PPA) {
             ssd->d_maptbl->counter.group_read_miss++;
             continue;
@@ -1657,12 +1778,14 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         }
         assert(ret_ppn != UNMAPPED_PPA);
         ppa = pgidx2ppa(ssd, ret_ppn);
-        if (trans_lun != NULL) {
-            struct nand_lun *data_lun;
-            data_lun = get_lun(ssd, &ppa);
-            data_lun->next_lun_avail_time = (trans_lun->next_lun_avail_time > data_lun->next_lun_avail_time) ? \
-                                            trans_lun->next_lun_avail_time : data_lun->next_lun_avail_time;
-        }
+
+        // 慢的方式
+        // if (trans_lun != NULL) {
+        //     struct nand_lun *data_lun;
+        //     data_lun = get_lun(ssd, &ppa);
+        //     data_lun->next_lun_avail_time = (trans_lun->next_lun_avail_time > data_lun->next_lun_avail_time) ? \
+        //                                     trans_lun->next_lun_avail_time : data_lun->next_lun_avail_time;
+        // }
 
         struct nand_cmd srd;
         srd.type = USER_IO;
@@ -1672,6 +1795,7 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         maxlat = (sublat > maxlat) ? sublat : maxlat;
     }
 
+ed:
     return maxlat;
 }
 
@@ -1698,6 +1822,9 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
             break;
     }
 
+    femu_log("[ssd_write]: req_id: %d, req_stag: %d\n", req->id, req->stag);
+
+
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         if (ssd->d_maptbl->counter.has_tbl[lpn] == 0) {
             ssd->d_maptbl->counter.has_tbl[lpn] = 1;
@@ -1706,7 +1833,7 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
             if (ssd->d_maptbl->counter.write_minLBA > lpn) ssd->d_maptbl->counter.write_minLBA = lpn;
         }
 
-        //femu_log("[write]: lpn:%lu\n", lpn);
+        // femu_log("[write]: lpn:%lu\n", lpn);
 
         w_translat = 0;
         ppa = get_maptbl_ent(ssd, lpn);
@@ -1765,19 +1892,25 @@ static void *ftl_thread(void *arg)
                 continue;
 
             rc = femu_ring_dequeue(ssd->to_ftl[i], (void *)&req, 1);
+            femu_log("[FTL_Thread]从to_FTL ring中取req_id: %d, req_stag: %d\n", req->id, req->stag);
             if (rc != 1) {
                 printf("FEMU: FTL to_ftl dequeue failed\n");
             }
 
+
+            // femu_log("[FTL_Thread] to_ftl_ring的请求个数: %u\n", femu_ring_count(ssd->to_ftl[i]));
+
             ftl_assert(req);
             switch (req->cmd.opcode) {
             case NVME_CMD_WRITE:
-                if (ssd->pass)
+                if (n->pass) {
                     lat = ssd_write(ssd, req);
+                }
                 break;
             case NVME_CMD_READ:
-                // if (ssd->pass)
-                    // lat = ssd_read(ssd, req);
+                if (n->pass) {
+                    lat = ssd_read(ssd, req, n);
+                }
                 break;
             case NVME_CMD_DSM:
                 lat = 0;
@@ -1804,7 +1937,7 @@ static void *ftl_thread(void *arg)
     return NULL;
 }
 
-void dftl_static(DFTLTable *d_maptbl) {
+void dftl_static(DFTLTable *d_maptbl, FemuCtrl *n) {
     femu_log("[DFTL]write_cnt:%d, read_cnt: %d, read_miss: %d, cmt_hit: %d, cmt_miss: %d, evit_cnt: %d, gc_data_cnt: %d, gc_trans_cnt:%d\n", 
     d_maptbl->counter.group_write_cnt, d_maptbl->counter.group_read_cnt,
     d_maptbl->counter.group_read_miss, d_maptbl->counter.group_cmt_hit,
@@ -1813,4 +1946,14 @@ void dftl_static(DFTLTable *d_maptbl) {
 
     femu_log("[DFTL]cache_cnt: %lu/%lu, nand_cnt: %lu/%lu\n", d_maptbl->CMT->count, d_maptbl->CMT->capacity, 
     d_maptbl->nand_cache->count, d_maptbl->nand_cache->capacity);
+
+    pqueue_t *pq = n->req_list;
+    femu_log("[DFTL]req_delay: %d, req_nodely: %d, 暂存队列请求数: %lu\n", d_maptbl->counter.req_dely, 
+            d_maptbl->counter.req_nodely, pqueue_size(pq));
+
+    NvmeRequest *req = pqueue_peek(pq);
+    if (req) {
+    femu_log("[DFTL]pq_req: req_id: %d, req_ex_st: %lu\n", req->id, req->expire_time_start);
+    }
+
 }

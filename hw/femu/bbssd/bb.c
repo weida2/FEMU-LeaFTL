@@ -1,5 +1,5 @@
 #include "../nvme.h"
-#include "./ftl.h"
+#include "./dftl.h"
 
 static void bb_init_ctrl_str(FemuCtrl *n)
 {
@@ -69,8 +69,8 @@ static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
         femu_log("%s,LeaFTL_IO [enabled]!\n", n->devname);
         break;
     case FEMU_ENABLE_DFTL_IO:
-        ssd->pass = 1;
-        femu_log("pass_cnt: %d\n", ssd->pass);
+        n->pass = 1;
+        femu_log("pass_cnt: %d\n", n->pass);
         femu_log("%s,DFTL_IO [enabled]!\n", n->devname);
         break;
     case FEMU_ENABLE_LEAEDFTL_IO:
@@ -83,8 +83,8 @@ static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
        // FrameGroup_static(&ssd->l_maptbl);
         break;   
     case FEMU_DFTL_Static:
-       // dftl_static(ssd->d_maptbl);
-        dftl_static(ssd);
+        dftl_static(ssd->d_maptbl, n);
+        // dftl_static(ssd);
         femu_log("%s,static [enabled]!\n", n->devname);
         // l_static(ssd);
         break;
